@@ -1,0 +1,18 @@
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -1332,9 +1332,12 @@ static int rtl822x_set_serdes_option_mod
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7587, 0x3);
+-	if (ret < 0)
+-		return ret;
++	/* Fixes no data transfer on 1gbps speed */
++	if (!of_machine_is_compatible("hasivo,s1100wp-8gt-se")) {
++		ret = phy_write_mmd(phydev, MDIO_MMD_VEND1, 0x7587, 0x3);
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1, 0x7587,
+ 					val, !(val & BIT(0)), 500, 100000, false);
