@@ -76,7 +76,112 @@
 		)
 		>;
 	};
+
+	i2c_scl23_sda22 {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		scl-gpios = <&gpio0 23 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 22 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		status = "okay";
+
+		clock-frequency = <100000>;
+
+		pse-hs104_0@0x0d {
+			compatible = "hasivo,hs104";
+			reg = <0x0d>;
+			status = "okay";
+		};
+
+		pse-hs104_1@0x15 {
+			compatible = "hasivo,hs104";
+			reg = <0x15>;
+			status = "okay";
+		};
+
+		stc8@4d {
+			compatible = "hasivo,stc8-mfd", "syscon";
+			reg = <0x4d>;
+			hasivo,execute-bit = <0x40>;
+			hasivo,execute-bit-registers = <0x01 0x02>;
+			status = "okay";
+
+			led_lan1_poe {
+				compatible = "register-bit-led";
+				reg = <0x01>;
+				mask = <0x08>;
+				trigger = "pse-hs104_0@0x0d:port0delivering";
+				label = "orange:lan1_poe";
+				status = "okay";
+			};
+
+			led_lan2_poe {
+				compatible = "register-bit-led";
+				reg = <0x01>;
+				mask = <0x04>;
+				trigger = "pse-hs104_0@0x0d:port1delivering";
+				label = "orange:lan2_poe";
+				status = "okay";
+			};
+
+			led_lan3_poe {
+				compatible = "register-bit-led";
+				reg = <0x01>;
+				mask = <0x02>;
+				trigger = "pse-hs104_0@0x0d:port2delivering";
+				label = "orange:lan3_poe";
+				status = "okay";
+			};
+
+			led_lan4_poe {
+				compatible = "register-bit-led";
+				reg = <0x01>;
+				mask = <0x01>;
+				trigger = "pse-hs104_0@0x0d:port3delivering";
+				label = "orange:lan4_poe";
+				status = "okay";
+			};
+
+			led_lan5_poe {
+				compatible = "register-bit-led";
+				reg = <0x02>;
+				mask = <0x08>;
+				trigger = "pse-hs104_1@0x15:port0delivering";
+				label = "orange:lan5_poe";
+				status = "okay";
+			};
+
+			led_lan6_poe {
+				compatible = "register-bit-led";
+				reg = <0x02>;
+				mask = <0x04>;
+				trigger = "pse-hs104_1@0x15:port1delivering";
+				label = "orange:lan6_poe";
+				status = "okay";
+			};
+
+			led_lan7_poe {
+				compatible = "register-bit-led";
+				reg = <0x02>;
+				mask = <0x02>;
+				trigger = "pse-hs104_1@0x15:port2delivering";
+				label = "orange:lan7_poe";
+				status = "okay";
+			};
+
+			led_lan8_poe {
+				compatible = "register-bit-led";
+				reg = <0x02>;
+				mask = <0x01>;
+				trigger = "pse-hs104_1@0x15:port3delivering";
+				label = "orange:lan8_poe";
+				status = "okay";
+			};
+		};
+	};
 };
+
 
 &spi0 {
 	status = "okay";
