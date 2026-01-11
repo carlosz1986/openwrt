@@ -1,163 +1,199 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Hasivo STC8 MFD driver with configurable write masking
- * I2C implementation with automatic child device enumeration
+ * Hasivo STC8 MFD driver for I2C-controlled LED registers
+ *
+ * This driver provides LED control for POE status indicators.
+ * LED configuration is parsed from device tree child nodes.
+ *
+ * Some registers require an "execute bit" to be set when writing.
+ * This is configured via DT properties:
+ *   - hasivo,execute-bit: the bit value (default 0x40)
+ *   - hasivo,execute-bit-registers: list of registers needing this bit
  */
 
-#include <linux/module.h>
 #include <linux/i2c.h>
-#include <linux/regmap.h>
+#include <linux/leds.h>
+#include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/slab.h>
-#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
 
-struct stc8_mfd {
-	struct device *dev;
-	struct regmap *parent_regmap;
-	struct regmap *child_regmap;
-	u32 exec_bit;
-	u32 *exec_regs;
-	size_t num_exec_regs;
+struct stc8_led {
+	struct led_classdev	cdev;
+	struct stc8_mfd		*mfd;
+	u8			reg;
+	u8			mask;
 };
 
-/* Check if register requires execute bit */
-static bool is_exec_reg(struct stc8_mfd *mfd, unsigned int reg)
+struct stc8_mfd {
+	struct device		*dev;
+	struct regmap		*regmap;
+	u32			exec_bit;
+	u32			*exec_regs;
+	size_t			num_exec_regs;
+	struct stc8_led		*leds;
+	size_t			num_leds;
+};
+
+static bool stc8_is_exec_reg(struct stc8_mfd *mfd, unsigned int reg)
 {
-	for (size_t i = 0; i < mfd->num_exec_regs; i++) {
+	size_t i;
+
+	for (i = 0; i < mfd->num_exec_regs; i++) {
 		if (mfd->exec_regs[i] == reg)
 			return true;
 	}
 	return false;
 }
 
-/* Custom regmap write wrapper */
-static int stc8_reg_write(void *context, unsigned int reg, unsigned int val)
+static int stc8_led_set(struct led_classdev *cdev, enum led_brightness brightness)
 {
-	struct stc8_mfd *mfd = context;
+	struct stc8_led *led = container_of(cdev, struct stc8_led, cdev);
+	struct stc8_mfd *mfd = led->mfd;
+	unsigned int val;
+	int ret;
 
-	/* Apply execute bit if this register is in the list */
-	if (is_exec_reg(mfd, reg)) {
-        dev_dbg(mfd->dev, "Applying exec bit to reg 0x%02x\n", reg);
+	ret = regmap_read(mfd->regmap, led->reg, &val);
+	if (ret)
+		return ret;
+
+	if (brightness)
+		val |= led->mask;
+	else
+		val &= ~led->mask;
+
+	if (stc8_is_exec_reg(mfd, led->reg))
 		val |= mfd->exec_bit;
-    }
 
-	/* Forward to parent regmap (I2C bus) */
-	return regmap_write(mfd->parent_regmap, reg, val);
+	return regmap_write(mfd->regmap, led->reg, val);
 }
 
-/* Custom regmap read - transparent passthrough */
-static int stc8_reg_read(void *context, unsigned int reg, unsigned int *val)
+static enum led_brightness stc8_led_get(struct led_classdev *cdev)
 {
-	struct stc8_mfd *mfd = context;
+	struct stc8_led *led = container_of(cdev, struct stc8_led, cdev);
+	unsigned int val;
 
-	return regmap_read(mfd->parent_regmap, reg, val);
+	if (regmap_read(led->mfd->regmap, led->reg, &val))
+		return 0;
+
+	return (val & led->mask) ? LED_ON : LED_OFF;
 }
 
-static const struct regmap_config stc8_parent_regmap_config = {
-	.name = "stc8-mfd-parent",
-	.reg_bits = 8,
-	.val_bits = 8,
-};
-
-static const struct regmap_config stc8_child_regmap_config = {
-	.name = "stc8-mfd-child",
-	.reg_bits = 8,
-	.val_bits = 8,
-	.reg_read = stc8_reg_read,
-	.reg_write = stc8_reg_write,
-};
-
-static int stc8_parse_dt(struct stc8_mfd *mfd, struct device_node *np)
+static int stc8_parse_exec_regs(struct stc8_mfd *mfd, struct device_node *np)
 {
-	int ret, count;
+	int count;
 
-	/* Get execute bit value (default 0x40) */
-    mfd->exec_bit = 0x40;
-	ret = of_property_read_u32(np, "hasivo,execute-bit", &mfd->exec_bit);
+	mfd->exec_bit = 0x40;
+	of_property_read_u32(np, "hasivo,execute-bit", &mfd->exec_bit);
 
-	/* Get count of execute registers */
 	count = of_property_count_u32_elems(np, "hasivo,execute-bit-registers");
-	if (count <= 0) {
-		mfd->num_exec_regs = 0;
+	if (count <= 0)
+		return 0;
+
+	mfd->exec_regs = devm_kcalloc(mfd->dev, count, sizeof(u32), GFP_KERNEL);
+	if (!mfd->exec_regs)
+		return -ENOMEM;
+
+	mfd->num_exec_regs = count;
+	return of_property_read_u32_array(np, "hasivo,execute-bit-registers",
+					  mfd->exec_regs, count);
+}
+
+static int stc8_register_leds(struct stc8_mfd *mfd, struct device_node *np)
+{
+	struct device_node *child;
+	struct stc8_led *led;
+	const char *str;
+	u32 reg_mask[2];
+	int num_leds = 0;
+	int ret;
+
+	/* Count valid LED child nodes */
+	for_each_child_of_node(np, child) {
+		if (!of_property_read_u32_array(child, "reg", reg_mask, 2))
+			num_leds++;
 	}
-    else {
-        mfd->num_exec_regs = count;
-        mfd->exec_regs = devm_kcalloc(mfd->dev, count, sizeof(u32),
-                        GFP_KERNEL);
-        if (!mfd->exec_regs)
-            return -ENOMEM;
 
-        ret = of_property_read_u32_array(np, "hasivo,execute-bit-registers",
-                        mfd->exec_regs, count);
-        if (ret) {
-            dev_err(mfd->dev, "Failed to read execute-bit-registers: %d\n", ret);
-            return ret;
-        }
-    }
+	if (num_leds == 0)
+		return 0;
 
-	dev_info(mfd->dev, "execute-bit=0x%02x, %zu execute-bit-registers\n",
-		 mfd->exec_bit, mfd->num_exec_regs);
+	mfd->leds = devm_kcalloc(mfd->dev, num_leds, sizeof(*mfd->leds),
+				 GFP_KERNEL);
+	if (!mfd->leds)
+		return -ENOMEM;
 
+	mfd->num_leds = num_leds;
+	led = mfd->leds;
+
+	for_each_child_of_node(np, child) {
+		if (of_property_read_u32_array(child, "reg", reg_mask, 2))
+			continue;
+
+		if (of_property_read_string(child, "label", &str)) {
+			dev_err(mfd->dev, "LED node missing 'label'\n");
+			of_node_put(child);
+			return -EINVAL;
+		}
+
+		led->mfd = mfd;
+		led->reg = reg_mask[0];
+		led->mask = reg_mask[1];
+		led->cdev.name = str;
+		led->cdev.max_brightness = 1;
+		led->cdev.brightness_set_blocking = stc8_led_set;
+		led->cdev.brightness_get = stc8_led_get;
+
+		if (!of_property_read_string(child, "linux,default-trigger", &str))
+			led->cdev.default_trigger = str;
+
+		ret = devm_led_classdev_register(mfd->dev, &led->cdev);
+		if (ret) {
+			dev_err(mfd->dev, "Failed to register LED %s\n",
+				led->cdev.name);
+			of_node_put(child);
+			return ret;
+		}
+
+		dev_dbg(mfd->dev, "LED %s: reg=0x%02x mask=0x%02x\n",
+			led->cdev.name, led->reg, led->mask);
+		led++;
+	}
+
+	dev_dbg(mfd->dev, "Registered %zu LEDs\n", mfd->num_leds);
 	return 0;
 }
 
-static int stc8_i2c_probe(struct i2c_client *client)
+static const struct regmap_config stc8_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+};
+
+static int stc8_probe(struct i2c_client *client)
 {
 	struct stc8_mfd *mfd;
 	int ret;
 
-	dev_dbg(&client->dev, "Hasivo STC8 MFD driver probed started\n");
-
-	mfd = devm_kzalloc(&client->dev, sizeof(struct stc8_mfd), GFP_KERNEL);
+	mfd = devm_kzalloc(&client->dev, sizeof(*mfd), GFP_KERNEL);
 	if (!mfd)
 		return -ENOMEM;
 
 	mfd->dev = &client->dev;
 	i2c_set_clientdata(client, mfd);
 
-	/* Parse device tree properties */
-	ret = stc8_parse_dt(mfd, mfd->dev->of_node);
+	mfd->regmap = devm_regmap_init_i2c(client, &stc8_regmap_config);
+	if (IS_ERR(mfd->regmap))
+		return dev_err_probe(&client->dev, PTR_ERR(mfd->regmap),
+				     "Failed to init regmap\n");
+
+	ret = stc8_parse_exec_regs(mfd, client->dev.of_node);
 	if (ret)
 		return ret;
 
-	/* Create parent regmap for direct I2C access */
-	mfd->parent_regmap = devm_regmap_init_i2c(client,
-						   &stc8_parent_regmap_config);
-	if (IS_ERR(mfd->parent_regmap)) {
-		dev_err(&client->dev, "Failed to init parent regmap\n");
-		return PTR_ERR(mfd->parent_regmap);
-	}
-
-	/* Create child regmap with custom read/write for masking */
-	mfd->child_regmap = devm_regmap_init(&client->dev, NULL, mfd,
-					      &stc8_child_regmap_config);
-	if (IS_ERR(mfd->child_regmap)) {
-		dev_err(&client->dev, "Failed to init child regmap\n");
-		return PTR_ERR(mfd->child_regmap);
-	}
-	/* Set the child regmap as the syscon regmap */
-	ret = of_syscon_register_regmap(mfd->dev->of_node, mfd->child_regmap);
+	ret = stc8_register_leds(mfd, client->dev.of_node);
 	if (ret)
 		return ret;
 
-	/* Automatically populate child devices from device tree */
-	ret = of_platform_populate(client->dev.of_node, NULL, NULL,
-				    &client->dev);
-	if (ret) {
-		dev_err(&client->dev, "Failed to add child devices: %d\n", ret);
-		return ret;
-	}
-
-	dev_dbg(&client->dev, "Hasivo STC8 MFD driver probed successfully\n");
-
+	dev_dbg(&client->dev, "STC8 MFD initialized\n");
 	return 0;
-}
-
-static void stc8_i2c_remove(struct i2c_client *client)
-{
-	of_platform_depopulate(&client->dev);
-	dev_dbg(&client->dev, "Hasivo STC8 MFD driver removed\n");
 }
 
 static const struct of_device_id stc8_of_match[] = {
@@ -166,16 +202,15 @@ static const struct of_device_id stc8_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, stc8_of_match);
 
-static struct i2c_driver stc8_i2c_driver = {
+static struct i2c_driver stc8_driver = {
 	.driver = {
 		.name = "hasivo-stc8-mfd",
 		.of_match_table = stc8_of_match,
 	},
-	.probe = stc8_i2c_probe,
-	.remove = stc8_i2c_remove,
+	.probe = stc8_probe,
 };
-module_i2c_driver(stc8_i2c_driver);
+module_i2c_driver(stc8_driver);
 
 MODULE_AUTHOR("Bevan Weiss <bevan.weiss@gmail.com>");
-MODULE_DESCRIPTION("Hasivo STC8 MFD driver with configurable write masking");
+MODULE_DESCRIPTION("Hasivo STC8 MFD driver for POE LED control");
 MODULE_LICENSE("GPL");
