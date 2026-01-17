@@ -179,22 +179,6 @@ static int hs104_pi_disable(struct pse_controller_dev *pcdev, int port)
 	return regmap_write(priv->regmap, HS104_REG_PW_EN, val);
 }
 
-static int hs104_pi_is_enabled(struct pse_controller_dev *pcdev, int port)
-{
-	struct hs104_priv *priv = to_hs104(pcdev);
-	unsigned int val;
-	int ret;
-
-	if (port < 0 || port >= HS104_MAX_PORTS)
-		return -EINVAL;
-
-	ret = regmap_read(priv->regmap, HS104_REG_PW_EN, &val);
-	if (ret)
-		return ret;
-
-	return !!(val & HS104_PORT_BIT(port));
-}
-
 static int hs104_pi_get_voltage(struct pse_controller_dev *pcdev, int port)
 {
 	struct hs104_priv *priv = to_hs104(pcdev);
@@ -246,6 +230,77 @@ static int hs104_pi_set_pw_limit(struct pse_controller_dev *pcdev,
 	return regmap_update_bits(priv->regmap, HS104_REG_PROTOCOL, mask, proto);
 }
 
+static int hs104_pi_get_admin_state(struct pse_controller_dev *pcdev, int id,
+				    struct pse_admin_state *admin_state)
+{
+	struct hs104_priv *priv = to_hs104(pcdev);
+	unsigned int val;
+	int ret;
+
+	if (id < 0 || id >= HS104_MAX_PORTS)
+		return -EINVAL;
+
+	ret = regmap_read(priv->regmap, HS104_REG_PW_EN, &val);
+	if (ret)
+		return ret;
+
+	if (val & HS104_PORT_BIT(id))
+		admin_state->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
+	else
+		admin_state->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
+
+	return 0;
+}
+
+static int hs104_pi_get_pw_status(struct pse_controller_dev *pcdev, int id,
+				  struct pse_pw_status *pw_status)
+{
+	struct hs104_priv *priv = to_hs104(pcdev);
+	unsigned int val;
+	int ret;
+
+	if (id < 0 || id >= HS104_MAX_PORTS)
+		return -EINVAL;
+
+	ret = regmap_read(priv->regmap, HS104_REG_PW_STATUS, &val);
+	if (ret)
+		return ret;
+
+	if (val & HS104_PORT_BIT(id))
+		pw_status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
+	else
+		pw_status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
+
+	return 0;
+}
+
+static int hs104_pi_get_pw_class(struct pse_controller_dev *pcdev, int id)
+{
+	struct hs104_priv *priv = to_hs104(pcdev);
+	unsigned int val;
+	int ret;
+
+	if (id < 0 || id >= HS104_MAX_PORTS)
+		return -EINVAL;
+
+	ret = regmap_read(priv->regmap, HS104_REG_PORT0_CLASS + id, &val);
+	if (ret)
+		return ret;
+
+	return val;
+}
+
+static int hs104_pi_get_actual_pw(struct pse_controller_dev *pcdev, int id)
+{
+	struct hs104_priv *priv = to_hs104(pcdev);
+
+	if (id < 0 || id >= HS104_MAX_PORTS)
+		return -EINVAL;
+
+	return hs104_read_be16(priv, HS104_REG_PORT0_POWER + id * 2,
+			       HS104_MW_STEP);
+}
+
 static const struct ethtool_c33_pse_pw_limit_range hs104_pw_ranges[] = {
 	{ .min = HS104_PW_AF,   .max = HS104_PW_AF },
 	{ .min = HS104_PW_AT,   .max = HS104_PW_AT },
@@ -253,77 +308,37 @@ static const struct ethtool_c33_pse_pw_limit_range hs104_pw_ranges[] = {
 	{ .min = HS104_PW_HIPO, .max = HS104_PW_HIPO },
 };
 
-static int hs104_ethtool_get_status(struct pse_controller_dev *pcdev,
-				    unsigned long port,
-				    struct netlink_ext_ack *extack,
-				    struct pse_control_status *st)
+static int hs104_pi_get_pw_limit_ranges(struct pse_controller_dev *pcdev,
+					int id,
+					struct pse_pw_limit_ranges *pw_limit_ranges)
 {
-	struct hs104_priv *priv = to_hs104(pcdev);
-	unsigned int val, proto;
-	bool enabled, delivering;
-	int ret;
+	struct ethtool_c33_pse_pw_limit_range *c33_pw_limit_ranges;
 
-	if (port >= HS104_MAX_PORTS)
+	if (id < 0 || id >= HS104_MAX_PORTS)
 		return -EINVAL;
 
-	/* Admin state */
-	ret = regmap_read(priv->regmap, HS104_REG_PW_EN, &val);
-	if (ret)
-		return ret;
-
-	enabled = !!(val & HS104_PORT_BIT(port));
-	st->c33_admin_state = enabled ? ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED :
-					ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
-
-	/* Power delivery status */
-	ret = regmap_read(priv->regmap, HS104_REG_PW_STATUS, &val);
-	if (ret)
-		return ret;
-
-	delivering = !!(val & HS104_PORT_BIT(port));
-	st->c33_pw_status = delivering ? ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING :
-					 ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
-
-	/* Power class */
-	ret = regmap_read(priv->regmap, HS104_REG_PORT0_CLASS + port, &val);
-	if (ret)
-		return ret;
-	st->c33_pw_class = val;
-
-	/* Actual power consumption */
-	ret = hs104_read_be16(priv, HS104_REG_PORT0_POWER + port * 2,
-			      HS104_MW_STEP);
-	if (ret < 0)
-		return ret;
-	st->c33_actual_pw = ret;
-
-	/* Power limit from protocol setting */
-	ret = regmap_read(priv->regmap, HS104_REG_PROTOCOL, &val);
-	if (ret)
-		return ret;
-
-	proto = (val >> (port * 2)) & HS104_PROTO_MASK;
-	st->c33_avail_pw_limit = hs104_proto_to_mw(proto);
-
-	/* Available power limit ranges */
-	st->c33_pw_limit_ranges = kmemdup(hs104_pw_ranges,
-					  sizeof(hs104_pw_ranges), GFP_KERNEL);
-	if (!st->c33_pw_limit_ranges)
+	c33_pw_limit_ranges = kmemdup(hs104_pw_ranges, sizeof(hs104_pw_ranges),
+				      GFP_KERNEL);
+	if (!c33_pw_limit_ranges)
 		return -ENOMEM;
 
-	st->c33_pw_limit_nb_ranges = ARRAY_SIZE(hs104_pw_ranges);
+	pw_limit_ranges->c33_pw_limit_ranges = c33_pw_limit_ranges;
 
-	return 0;
+	/* Return number of ranges */
+	return ARRAY_SIZE(hs104_pw_ranges);
 }
 
 static const struct pse_controller_ops hs104_ops = {
-	.ethtool_get_status	= hs104_ethtool_get_status,
 	.pi_enable		= hs104_pi_enable,
 	.pi_disable		= hs104_pi_disable,
-	.pi_is_enabled		= hs104_pi_is_enabled,
+	.pi_get_admin_state	= hs104_pi_get_admin_state,
+	.pi_get_pw_status	= hs104_pi_get_pw_status,
+	.pi_get_pw_class	= hs104_pi_get_pw_class,
+	.pi_get_actual_pw	= hs104_pi_get_actual_pw,
 	.pi_get_voltage		= hs104_pi_get_voltage,
 	.pi_get_pw_limit	= hs104_pi_get_pw_limit,
 	.pi_set_pw_limit	= hs104_pi_set_pw_limit,
+	.pi_get_pw_limit_ranges	= hs104_pi_get_pw_limit_ranges,
 };
 
 /* Sysfs interface for direct port control */
