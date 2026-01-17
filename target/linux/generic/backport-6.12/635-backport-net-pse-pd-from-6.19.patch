@@ -1,0 +1,4540 @@
+--- a/drivers/net/pse-pd/Kconfig
++++ b/drivers/net/pse-pd/Kconfig
+@@ -32,6 +32,17 @@ config PSE_PD692X0
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called pd692x0.
+ 
++config PSE_SI3474
++	tristate "Si3474 PSE controller"
++	depends on I2C
++	help
++	  This module provides support for Si3474 regulator based Ethernet
++	  Power Sourcing Equipment.
++	  Only 4-pair PSE configurations are supported.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called si3474.
++
+ config PSE_TPS23881
+ 	tristate "TPS23881 PSE controller"
+ 	depends on I2C
+--- a/drivers/net/pse-pd/Makefile
++++ b/drivers/net/pse-pd/Makefile
+@@ -5,4 +5,5 @@ obj-$(CONFIG_PSE_CONTROLLER) += pse_core
+ 
+ obj-$(CONFIG_PSE_REGULATOR) += pse_regulator.o
+ obj-$(CONFIG_PSE_PD692X0) += pd692x0.o
++obj-$(CONFIG_PSE_SI3474) += si3474.o
+ obj-$(CONFIG_PSE_TPS23881) += tps23881.o
+--- a/drivers/net/pse-pd/pd692x0.c
++++ b/drivers/net/pse-pd/pd692x0.c
+@@ -12,6 +12,8 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pse-pd/pse.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/machine.h>
+ 
+ #define PD692X0_PSE_NAME "pd692x0_pse"
+ 
+@@ -28,6 +30,8 @@
+ #define PD692X0_FW_MIN_VER	5
+ #define PD692X0_FW_PATCH_VER	5
+ 
++#define PD692X0_USER_BYTE	42
++
+ enum pd692x0_fw_state {
+ 	PD692X0_FW_UNKNOWN,
+ 	PD692X0_FW_OK,
+@@ -76,11 +80,19 @@ enum {
+ 	PD692X0_MSG_GET_PORT_CLASS,
+ 	PD692X0_MSG_GET_PORT_MEAS,
+ 	PD692X0_MSG_GET_PORT_PARAM,
++	PD692X0_MSG_GET_POWER_BANK,
++	PD692X0_MSG_SET_POWER_BANK,
++	PD692X0_MSG_SET_USER_BYTE,
+ 
+ 	/* add new message above here */
+ 	PD692X0_MSG_CNT
+ };
+ 
++struct pd692x0_matrix {
++	u8 hw_port_a;
++	u8 hw_port_b;
++};
++
+ struct pd692x0_priv {
+ 	struct i2c_client *client;
+ 	struct pse_controller_dev pcdev;
+@@ -94,7 +106,12 @@ struct pd692x0_priv {
+ 	bool last_cmd_key;
+ 	unsigned long last_cmd_key_time;
+ 
++	bool cfg_saved;
+ 	enum ethtool_c33_pse_admin_state admin_state[PD692X0_MAX_PIS];
++	struct regulator_dev *manager_reg[PD692X0_MAX_MANAGERS];
++	int manager_pw_budget[PD692X0_MAX_MANAGERS];
++	int nmanagers;
++	struct pd692x0_matrix *port_matrix;
+ };
+ 
+ /* Template list of communication messages. The non-null bytes defined here
+@@ -170,6 +187,22 @@ static const struct pd692x0_msg pd692x0_
+ 		.data = {0x4e, 0x4e, 0x4e, 0x4e,
+ 			 0x4e, 0x4e, 0x4e, 0x4e},
+ 	},
++	[PD692X0_MSG_GET_POWER_BANK] = {
++		.key = PD692X0_KEY_REQ,
++		.sub = {0x07, 0x0b, 0x57},
++		.data = {   0, 0x4e, 0x4e, 0x4e,
++			 0x4e, 0x4e, 0x4e, 0x4e},
++	},
++	[PD692X0_MSG_SET_POWER_BANK] = {
++		.key = PD692X0_KEY_CMD,
++		.sub = {0x07, 0x0b, 0x57},
++	},
++	[PD692X0_MSG_SET_USER_BYTE] = {
++		.key = PD692X0_KEY_PRG,
++		.sub = {0x41, PD692X0_USER_BYTE},
++		.data = {0x4e, 0x4e, 0x4e, 0x4e,
++			 0x4e, 0x4e, 0x4e, 0x4e},
++	},
+ };
+ 
+ static u8 pd692x0_build_msg(struct pd692x0_msg *msg, u8 echo)
+@@ -431,31 +464,6 @@ static int pd692x0_pi_disable(struct pse
+ 	return 0;
+ }
+ 
+-static int pd692x0_pi_is_enabled(struct pse_controller_dev *pcdev, int id)
+-{
+-	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
+-	struct pd692x0_msg msg, buf = {0};
+-	int ret;
+-
+-	ret = pd692x0_fw_unavailable(priv);
+-	if (ret)
+-		return ret;
+-
+-	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_STATUS];
+-	msg.sub[2] = id;
+-	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
+-	if (ret < 0)
+-		return ret;
+-
+-	if (buf.sub[1]) {
+-		priv->admin_state[id] = ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
+-		return 1;
+-	} else {
+-		priv->admin_state[id] = ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
+-		return 0;
+-	}
+-}
+-
+ struct pd692x0_pse_ext_state_mapping {
+ 	u32 status_code;
+ 	enum ethtool_c33_pse_ext_state pse_ext_state;
+@@ -517,21 +525,38 @@ pd692x0_pse_ext_state_map[] = {
+ 	{ /* sentinel */ }
+ };
+ 
+-static void
+-pd692x0_get_ext_state(struct ethtool_c33_pse_ext_state_info *c33_ext_state_info,
+-		      u32 status_code)
++static int
++pd692x0_pi_get_ext_state(struct pse_controller_dev *pcdev, int id,
++			 struct pse_ext_state_info *ext_state_info)
+ {
++	struct ethtool_c33_pse_ext_state_info *c33_ext_state_info;
+ 	const struct pd692x0_pse_ext_state_mapping *ext_state_map;
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	int ret;
++
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
++		return ret;
+ 
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_STATUS];
++	msg.sub[2] = id;
++	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
++	if (ret < 0)
++		return ret;
++
++	c33_ext_state_info = &ext_state_info->c33_ext_state_info;
+ 	ext_state_map = pd692x0_pse_ext_state_map;
+ 	while (ext_state_map->status_code) {
+-		if (ext_state_map->status_code == status_code) {
++		if (ext_state_map->status_code == buf.sub[0]) {
+ 			c33_ext_state_info->c33_pse_ext_state = ext_state_map->pse_ext_state;
+ 			c33_ext_state_info->__c33_pse_ext_substate = ext_state_map->pse_ext_substate;
+-			return;
++			return  0;
+ 		}
+ 		ext_state_map++;
+ 	}
++
++	return 0;
+ }
+ 
+ struct pd692x0_class_pw {
+@@ -613,35 +638,66 @@ static int pd692x0_pi_set_pw_from_table(
+ }
+ 
+ static int
+-pd692x0_pi_get_pw_ranges(struct pse_control_status *st)
++pd692x0_pi_get_pw_limit_ranges(struct pse_controller_dev *pcdev, int id,
++			       struct pse_pw_limit_ranges *pw_limit_ranges)
+ {
++	struct ethtool_c33_pse_pw_limit_range *c33_pw_limit_ranges;
+ 	const struct pd692x0_class_pw *pw_table;
+ 	int i;
+ 
+ 	pw_table = pd692x0_class_pw_table;
+-	st->c33_pw_limit_ranges = kcalloc(PD692X0_CLASS_PW_TABLE_SIZE,
+-					  sizeof(struct ethtool_c33_pse_pw_limit_range),
+-					  GFP_KERNEL);
+-	if (!st->c33_pw_limit_ranges)
++	c33_pw_limit_ranges = kcalloc(PD692X0_CLASS_PW_TABLE_SIZE,
++				      sizeof(*c33_pw_limit_ranges),
++				      GFP_KERNEL);
++	if (!c33_pw_limit_ranges)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < PD692X0_CLASS_PW_TABLE_SIZE; i++, pw_table++) {
+-		st->c33_pw_limit_ranges[i].min = pw_table->class_pw;
+-		st->c33_pw_limit_ranges[i].max = pw_table->class_pw + pw_table->max_added_class_pw;
++		c33_pw_limit_ranges[i].min = pw_table->class_pw;
++		c33_pw_limit_ranges[i].max = pw_table->class_pw +
++					     pw_table->max_added_class_pw;
+ 	}
+ 
+-	st->c33_pw_limit_nb_ranges = i;
++	pw_limit_ranges->c33_pw_limit_ranges = c33_pw_limit_ranges;
++	return i;
++}
++
++static int
++pd692x0_pi_get_admin_state(struct pse_controller_dev *pcdev, int id,
++			   struct pse_admin_state *admin_state)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	int ret;
++
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
++		return ret;
++
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_STATUS];
++	msg.sub[2] = id;
++	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
++	if (ret < 0)
++		return ret;
++
++	if (buf.sub[1])
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
++	else
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++
++	priv->admin_state[id] = admin_state->c33_admin_state;
++
+ 	return 0;
+ }
+ 
+-static int pd692x0_ethtool_get_status(struct pse_controller_dev *pcdev,
+-				      unsigned long id,
+-				      struct netlink_ext_ack *extack,
+-				      struct pse_control_status *status)
++static int
++pd692x0_pi_get_pw_status(struct pse_controller_dev *pcdev, int id,
++			 struct pse_pw_status *pw_status)
+ {
+ 	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
+ 	struct pd692x0_msg msg, buf = {0};
+-	u32 class;
+ 	int ret;
+ 
+ 	ret = pd692x0_fw_unavailable(priv);
+@@ -656,52 +712,87 @@ static int pd692x0_ethtool_get_status(st
+ 
+ 	/* Compare Port Status (Communication Protocol Document par. 7.1) */
+ 	if ((buf.sub[0] & 0xf0) == 0x80 || (buf.sub[0] & 0xf0) == 0x90)
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
+ 	else if (buf.sub[0] == 0x1b || buf.sub[0] == 0x22)
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_SEARCHING;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_SEARCHING;
+ 	else if (buf.sub[0] == 0x12)
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_FAULT;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_FAULT;
+ 	else
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
+ 
+-	if (buf.sub[1])
+-		status->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
+-	else
+-		status->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++	return 0;
++}
+ 
+-	priv->admin_state[id] = status->c33_admin_state;
++static int
++pd692x0_pi_get_pw_class(struct pse_controller_dev *pcdev, int id)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	u32 class;
++	int ret;
+ 
+-	pd692x0_get_ext_state(&status->c33_ext_state_info, buf.sub[0]);
+-	status->c33_actual_pw = (buf.data[0] << 4 | buf.data[1]) * 100;
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
++		return ret;
+ 
+-	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_PARAM];
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_CLASS];
+ 	msg.sub[2] = id;
+-	memset(&buf, 0, sizeof(buf));
+ 	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = pd692x0_pi_get_pw_from_table(buf.data[0], buf.data[1]);
+-	if (ret < 0)
++	class = buf.data[3] >> 4;
++	if (class <= 8)
++		return class;
++
++	return 0;
++}
++
++static int
++pd692x0_pi_get_actual_pw(struct pse_controller_dev *pcdev, int id)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	int ret;
++
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
+ 		return ret;
+-	status->c33_avail_pw_limit = ret;
+ 
+-	memset(&buf, 0, sizeof(buf));
+-	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_CLASS];
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_STATUS];
+ 	msg.sub[2] = id;
+ 	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	class = buf.data[3] >> 4;
+-	if (class <= 8)
+-		status->c33_pw_class = class;
++	return (buf.data[0] << 4 | buf.data[1]) * 100;
++}
++
++static int
++pd692x0_pi_get_prio(struct pse_controller_dev *pcdev, int id)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	int ret;
++
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
++		return ret;
+ 
+-	ret = pd692x0_pi_get_pw_ranges(status);
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_PORT_PARAM];
++	msg.sub[2] = id;
++	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
+ 	if (ret < 0)
+ 		return ret;
++	if (!buf.data[2] || buf.data[2] > pcdev->pis_prio_max + 1)
++		return -ERANGE;
+ 
+-	return 0;
++	/* PSE core priority start at 0 */
++	return buf.data[2] - 1;
+ }
+ 
+ static struct pd692x0_msg_ver pd692x0_get_sw_version(struct pd692x0_priv *priv)
+@@ -731,14 +822,10 @@ static struct pd692x0_msg_ver pd692x0_ge
+ 
+ struct pd692x0_manager {
+ 	struct device_node *port_node[PD692X0_MAX_MANAGER_PORTS];
++	struct device_node *node;
+ 	int nports;
+ };
+ 
+-struct pd692x0_matrix {
+-	u8 hw_port_a;
+-	u8 hw_port_b;
+-};
+-
+ static int
+ pd692x0_of_get_ports_manager(struct pd692x0_priv *priv,
+ 			     struct pd692x0_manager *manager,
+@@ -785,7 +872,7 @@ out:
+ 
+ static int
+ pd692x0_of_get_managers(struct pd692x0_priv *priv,
+-			struct pd692x0_manager manager[PD692X0_MAX_MANAGERS])
++			struct pd692x0_manager *manager)
+ {
+ 	struct device_node *managers_node, *node;
+ 	int ret, nmanagers, i, j;
+@@ -822,11 +909,14 @@ pd692x0_of_get_managers(struct pd692x0_p
+ 		if (ret)
+ 			goto out;
+ 
++		of_node_get(node);
++		manager[manager_id].node = node;
+ 		nmanagers++;
+ 	}
+ 
+ 	of_node_put(managers_node);
+-	return nmanagers;
++	priv->nmanagers = nmanagers;
++	return 0;
+ 
+ out:
+ 	for (i = 0; i < nmanagers; i++) {
+@@ -834,6 +924,8 @@ out:
+ 			of_node_put(manager[i].port_node[j]);
+ 			manager[i].port_node[j] = NULL;
+ 		}
++		of_node_put(manager[i].node);
++		manager[i].node = NULL;
+ 	}
+ 
+ 	of_node_put(node);
+@@ -841,6 +933,161 @@ out:
+ 	return ret;
+ }
+ 
++static const struct regulator_ops dummy_ops;
++
++static struct regulator_dev *
++pd692x0_register_manager_regulator(struct device *dev, char *reg_name,
++				   struct device_node *node)
++{
++	struct regulator_init_data *rinit_data;
++	struct regulator_config rconfig = {0};
++	struct regulator_desc *rdesc;
++	struct regulator_dev *rdev;
++
++	rinit_data = devm_kzalloc(dev, sizeof(*rinit_data),
++				  GFP_KERNEL);
++	if (!rinit_data)
++		return ERR_PTR(-ENOMEM);
++
++	rdesc = devm_kzalloc(dev, sizeof(*rdesc), GFP_KERNEL);
++	if (!rdesc)
++		return ERR_PTR(-ENOMEM);
++
++	rdesc->name = reg_name;
++	rdesc->type = REGULATOR_VOLTAGE;
++	rdesc->ops = &dummy_ops;
++	rdesc->owner = THIS_MODULE;
++
++	rinit_data->supply_regulator = "vmain";
++
++	rconfig.dev = dev;
++	rconfig.init_data = rinit_data;
++	rconfig.of_node = node;
++
++	rdev = devm_regulator_register(dev, rdesc, &rconfig);
++	if (IS_ERR(rdev)) {
++		dev_err_probe(dev, PTR_ERR(rdev),
++			      "Failed to register regulator\n");
++		return rdev;
++	}
++
++	return rdev;
++}
++
++static int
++pd692x0_register_managers_regulator(struct pd692x0_priv *priv,
++				    const struct pd692x0_manager *manager)
++{
++	struct device *dev = &priv->client->dev;
++	size_t reg_name_len;
++	int i;
++
++	/* Each regulator name len is dev name + 12 char +
++	 * int max digit number (10) + 1
++	 */
++	reg_name_len = strlen(dev_name(dev)) + 23;
++
++	for (i = 0; i < priv->nmanagers; i++) {
++		static const char * const regulators[] = { "vaux5", "vaux3p3" };
++		struct regulator_dev *rdev;
++		char *reg_name;
++		int ret;
++
++		reg_name = devm_kzalloc(dev, reg_name_len, GFP_KERNEL);
++		if (!reg_name)
++			return -ENOMEM;
++		snprintf(reg_name, 26, "pse-%s-manager%d", dev_name(dev), i);
++		rdev = pd692x0_register_manager_regulator(dev, reg_name,
++							  manager[i].node);
++		if (IS_ERR(rdev))
++			return PTR_ERR(rdev);
++
++		/* VMAIN is described as main supply for the manager.
++		 * Add other VAUX power supplies and link them to the
++		 * virtual device rdev->dev.
++		 */
++		ret = devm_regulator_bulk_get_enable(&rdev->dev,
++						     ARRAY_SIZE(regulators),
++						     regulators);
++		if (ret)
++			return dev_err_probe(&rdev->dev, ret,
++					     "Failed to enable regulators\n");
++
++		priv->manager_reg[i] = rdev;
++	}
++
++	return 0;
++}
++
++static int
++pd692x0_conf_manager_power_budget(struct pd692x0_priv *priv, int id)
++{
++	struct pd692x0_msg msg, buf;
++	int ret, pw_mW;
++
++	pw_mW = priv->manager_pw_budget[id] / 1000;
++	if (!pw_mW)
++		return 0;
++
++	msg = pd692x0_msg_template_list[PD692X0_MSG_GET_POWER_BANK];
++	msg.data[0] = id;
++	ret = pd692x0_sendrecv_msg(priv, &msg, &buf);
++	if (ret < 0)
++		return ret;
++
++	msg = pd692x0_msg_template_list[PD692X0_MSG_SET_POWER_BANK];
++	msg.data[0] = id;
++	msg.data[1] = pw_mW >> 8;
++	msg.data[2] = pw_mW & 0xff;
++	msg.data[3] = buf.sub[2];
++	msg.data[4] = buf.data[0];
++	msg.data[5] = buf.data[1];
++	msg.data[6] = buf.data[2];
++	msg.data[7] = buf.data[3];
++	return pd692x0_sendrecv_msg(priv, &msg, &buf);
++}
++
++static int
++pd692x0_req_managers_pw_budget(struct pd692x0_priv *priv)
++{
++	int i, ret;
++
++	for (i = 0; i < priv->nmanagers; i++) {
++		struct regulator *supply = priv->manager_reg[i]->supply;
++		int pw_budget;
++
++		pw_budget = regulator_get_unclaimed_power_budget(supply);
++		if (!pw_budget)
++			/* Do nothing if no power budget */
++			continue;
++
++		/* Max power budget per manager */
++		if (pw_budget > 6000000)
++			pw_budget = 6000000;
++		ret = regulator_request_power_budget(supply, pw_budget);
++		if (ret < 0)
++			return ret;
++
++		priv->manager_pw_budget[i] = pw_budget;
++	}
++
++	return 0;
++}
++
++static int
++pd692x0_configure_managers(struct pd692x0_priv *priv)
++{
++	int i, ret;
++
++	for (i = 0; i < priv->nmanagers; i++) {
++		ret = pd692x0_conf_manager_power_budget(priv, i);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int
+ pd692x0_set_port_matrix(const struct pse_pi_pairset *pairset,
+ 			const struct pd692x0_manager *manager,
+@@ -881,10 +1128,9 @@ pd692x0_set_port_matrix(const struct pse
+ 
+ static int
+ pd692x0_set_ports_matrix(struct pd692x0_priv *priv,
+-			 const struct pd692x0_manager *manager,
+-			 int nmanagers,
+-			 struct pd692x0_matrix port_matrix[PD692X0_MAX_PIS])
++			 const struct pd692x0_manager *manager)
+ {
++	struct pd692x0_matrix *port_matrix = priv->port_matrix;
+ 	struct pse_controller_dev *pcdev = &priv->pcdev;
+ 	int i, ret;
+ 
+@@ -897,7 +1143,7 @@ pd692x0_set_ports_matrix(struct pd692x0_
+ 	/* Update with values for every PSE PIs */
+ 	for (i = 0; i < pcdev->nr_lines; i++) {
+ 		ret = pd692x0_set_port_matrix(&pcdev->pi[i].pairset[0],
+-					      manager, nmanagers,
++					      manager, priv->nmanagers,
+ 					      &port_matrix[i]);
+ 		if (ret) {
+ 			dev_err(&priv->client->dev,
+@@ -906,7 +1152,7 @@ pd692x0_set_ports_matrix(struct pd692x0_
+ 		}
+ 
+ 		ret = pd692x0_set_port_matrix(&pcdev->pi[i].pairset[1],
+-					      manager, nmanagers,
++					      manager, priv->nmanagers,
+ 					      &port_matrix[i]);
+ 		if (ret) {
+ 			dev_err(&priv->client->dev,
+@@ -919,9 +1165,9 @@ pd692x0_set_ports_matrix(struct pd692x0_
+ }
+ 
+ static int
+-pd692x0_write_ports_matrix(struct pd692x0_priv *priv,
+-			   const struct pd692x0_matrix port_matrix[PD692X0_MAX_PIS])
++pd692x0_write_ports_matrix(struct pd692x0_priv *priv)
+ {
++	struct pd692x0_matrix *port_matrix = priv->port_matrix;
+ 	struct pd692x0_msg msg, buf;
+ 	int ret, i;
+ 
+@@ -946,36 +1192,122 @@ pd692x0_write_ports_matrix(struct pd692x
+ 	return 0;
+ }
+ 
+-static int pd692x0_setup_pi_matrix(struct pse_controller_dev *pcdev)
++static int pd692x0_hw_conf_init(struct pd692x0_priv *priv)
+ {
+-	struct pd692x0_manager manager[PD692X0_MAX_MANAGERS] = {0};
+-	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
+-	struct pd692x0_matrix port_matrix[PD692X0_MAX_PIS];
+-	int ret, i, j, nmanagers;
++	int ret;
+ 
+-	/* Should we flash the port matrix */
++	/* Is PD692x0 ready to be configured? */
+ 	if (priv->fw_state != PD692X0_FW_OK &&
+ 	    priv->fw_state != PD692X0_FW_COMPLETE)
+ 		return 0;
+ 
+-	ret = pd692x0_of_get_managers(priv, manager);
+-	if (ret < 0)
++	ret = pd692x0_configure_managers(priv);
++	if (ret)
+ 		return ret;
+ 
+-	nmanagers = ret;
+-	ret = pd692x0_set_ports_matrix(priv, manager, nmanagers, port_matrix);
++	ret = pd692x0_write_ports_matrix(priv);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+-	ret = pd692x0_write_ports_matrix(priv, port_matrix);
+-	if (ret)
+-		goto out;
++	return 0;
++}
+ 
+-out:
+-	for (i = 0; i < nmanagers; i++) {
++static void pd692x0_of_put_managers(struct pd692x0_priv *priv,
++				    struct pd692x0_manager *manager)
++{
++	int i, j;
++
++	for (i = 0; i < priv->nmanagers; i++) {
+ 		for (j = 0; j < manager[i].nports; j++)
+ 			of_node_put(manager[i].port_node[j]);
++		of_node_put(manager[i].node);
++	}
++}
++
++static void pd692x0_managers_free_pw_budget(struct pd692x0_priv *priv)
++{
++	int i;
++
++	for (i = 0; i < PD692X0_MAX_MANAGERS; i++) {
++		struct regulator *supply;
++
++		if (!priv->manager_reg[i] || !priv->manager_pw_budget[i])
++			continue;
++
++		supply = priv->manager_reg[i]->supply;
++		if (!supply)
++			continue;
++
++		regulator_free_power_budget(supply,
++					    priv->manager_pw_budget[i]);
++	}
++}
++
++static int
++pd692x0_save_user_byte(struct pd692x0_priv *priv)
++{
++	struct pd692x0_msg msg, buf;
++
++	msg = pd692x0_msg_template_list[PD692X0_MSG_SET_USER_BYTE];
++	return pd692x0_sendrecv_msg(priv, &msg, &buf);
++}
++
++static int pd692x0_setup_pi_matrix(struct pse_controller_dev *pcdev)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_matrix *port_matrix;
++	struct pd692x0_manager *manager;
++	int ret;
++
++	manager = kcalloc(PD692X0_MAX_MANAGERS, sizeof(*manager), GFP_KERNEL);
++	if (!manager)
++		return -ENOMEM;
++
++	port_matrix = devm_kcalloc(&priv->client->dev, PD692X0_MAX_PIS,
++				   sizeof(*port_matrix), GFP_KERNEL);
++	if (!port_matrix) {
++		ret = -ENOMEM;
++		goto err_free_manager;
++	}
++	priv->port_matrix = port_matrix;
++
++	ret = pd692x0_of_get_managers(priv, manager);
++	if (ret < 0)
++		goto err_free_manager;
++
++	ret = pd692x0_register_managers_regulator(priv, manager);
++	if (ret)
++		goto err_of_managers;
++
++	ret = pd692x0_req_managers_pw_budget(priv);
++	if (ret)
++		goto err_of_managers;
++
++	ret = pd692x0_set_ports_matrix(priv, manager);
++	if (ret)
++		goto err_managers_req_pw;
++
++	/* Do not init the conf if it is already saved */
++	if (!priv->cfg_saved) {
++		ret = pd692x0_hw_conf_init(priv);
++		if (ret)
++			goto err_managers_req_pw;
++
++		ret = pd692x0_save_user_byte(priv);
++		if (ret)
++			goto err_managers_req_pw;
+ 	}
++
++	pd692x0_of_put_managers(priv, manager);
++	kfree(manager);
++	return 0;
++
++err_managers_req_pw:
++	pd692x0_managers_free_pw_budget(priv);
++err_of_managers:
++	pd692x0_of_put_managers(priv, manager);
++err_free_manager:
++	kfree(manager);
+ 	return ret;
+ }
+ 
+@@ -1036,15 +1368,40 @@ static int pd692x0_pi_set_pw_limit(struc
+ 	return pd692x0_sendrecv_msg(priv, &msg, &buf);
+ }
+ 
++static int pd692x0_pi_set_prio(struct pse_controller_dev *pcdev, int id,
++			       unsigned int prio)
++{
++	struct pd692x0_priv *priv = to_pd692x0_priv(pcdev);
++	struct pd692x0_msg msg, buf = {0};
++	int ret;
++
++	ret = pd692x0_fw_unavailable(priv);
++	if (ret)
++		return ret;
++
++	msg = pd692x0_msg_template_list[PD692X0_MSG_SET_PORT_PARAM];
++	msg.sub[2] = id;
++	/* Controller priority from 1 to 3 */
++	msg.data[4] = prio + 1;
++
++	return pd692x0_sendrecv_msg(priv, &msg, &buf);
++}
++
+ static const struct pse_controller_ops pd692x0_ops = {
+ 	.setup_pi_matrix = pd692x0_setup_pi_matrix,
+-	.ethtool_get_status = pd692x0_ethtool_get_status,
++	.pi_get_admin_state = pd692x0_pi_get_admin_state,
++	.pi_get_pw_status = pd692x0_pi_get_pw_status,
++	.pi_get_ext_state = pd692x0_pi_get_ext_state,
++	.pi_get_pw_class = pd692x0_pi_get_pw_class,
++	.pi_get_actual_pw = pd692x0_pi_get_actual_pw,
+ 	.pi_enable = pd692x0_pi_enable,
+ 	.pi_disable = pd692x0_pi_disable,
+-	.pi_is_enabled = pd692x0_pi_is_enabled,
+ 	.pi_get_voltage = pd692x0_pi_get_voltage,
+ 	.pi_get_pw_limit = pd692x0_pi_get_pw_limit,
+ 	.pi_set_pw_limit = pd692x0_pi_set_pw_limit,
++	.pi_get_pw_limit_ranges = pd692x0_pi_get_pw_limit_ranges,
++	.pi_get_prio = pd692x0_pi_get_prio,
++	.pi_set_prio = pd692x0_pi_set_prio,
+ };
+ 
+ #define PD692X0_FW_LINE_MAX_SZ 0xff
+@@ -1353,7 +1710,7 @@ static enum fw_upload_err pd692x0_fw_pol
+ 		return FW_UPLOAD_ERR_FW_INVALID;
+ 	}
+ 
+-	ret = pd692x0_setup_pi_matrix(&priv->pcdev);
++	ret = pd692x0_hw_conf_init(priv);
+ 	if (ret < 0) {
+ 		dev_err(&client->dev, "Error configuring ports matrix (%pe)\n",
+ 			ERR_PTR(ret));
+@@ -1398,6 +1755,7 @@ static const struct fw_upload_ops pd692x
+ 
+ static int pd692x0_i2c_probe(struct i2c_client *client)
+ {
++	static const char * const regulators[] = { "vdd", "vdda" };
+ 	struct pd692x0_msg msg, buf = {0}, zero = {0};
+ 	struct device *dev = &client->dev;
+ 	struct pd692x0_msg_ver ver;
+@@ -1405,6 +1763,12 @@ static int pd692x0_i2c_probe(struct i2c_
+ 	struct fw_upload *fwl;
+ 	int ret;
+ 
++	ret = devm_regulator_bulk_get_enable(dev, ARRAY_SIZE(regulators),
++					     regulators);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "Failed to enable regulators\n");
++
+ 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+ 		dev_err(dev, "i2c check functionality failed\n");
+ 		return -ENXIO;
+@@ -1455,12 +1819,17 @@ static int pd692x0_i2c_probe(struct i2c_
+ 		}
+ 	}
+ 
++	if (buf.data[2] == PD692X0_USER_BYTE)
++		priv->cfg_saved = true;
++
+ 	priv->np = dev->of_node;
+ 	priv->pcdev.nr_lines = PD692X0_MAX_PIS;
+ 	priv->pcdev.owner = THIS_MODULE;
+ 	priv->pcdev.ops = &pd692x0_ops;
+ 	priv->pcdev.dev = dev;
+ 	priv->pcdev.types = ETHTOOL_PSE_C33;
++	priv->pcdev.supp_budget_eval_strategies = PSE_BUDGET_EVAL_STRAT_DYNAMIC;
++	priv->pcdev.pis_prio_max = 2;
+ 	ret = devm_pse_controller_register(dev, &priv->pcdev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+@@ -1480,6 +1849,7 @@ static void pd692x0_i2c_remove(struct i2
+ {
+ 	struct pd692x0_priv *priv = i2c_get_clientdata(client);
+ 
++	pd692x0_managers_free_pw_budget(priv);
+ 	firmware_upload_unregister(priv->fwl);
+ }
+ 
+--- a/drivers/net/pse-pd/pse_core.c
++++ b/drivers/net/pse-pd/pse_core.c
+@@ -6,13 +6,22 @@
+ //
+ 
+ #include <linux/device.h>
++#include <linux/ethtool.h>
++#include <linux/ethtool_netlink.h>
+ #include <linux/of.h>
++#include <linux/phy.h>
+ #include <linux/pse-pd/pse.h>
+ #include <linux/regulator/driver.h>
+ #include <linux/regulator/machine.h>
++#include <linux/rtnetlink.h>
++#include <net/net_trackers.h>
++
++#define PSE_PW_D_LIMIT INT_MAX
+ 
+ static DEFINE_MUTEX(pse_list_mutex);
+ static LIST_HEAD(pse_controller_list);
++static DEFINE_XARRAY_ALLOC(pse_pw_d_map);
++static DEFINE_MUTEX(pse_pw_d_mutex);
+ 
+ /**
+  * struct pse_control - a PSE control
+@@ -22,6 +31,7 @@ static LIST_HEAD(pse_controller_list);
+  * @list: list entry for the pcdev's PSE controller list
+  * @id: ID of the PSE line in the PSE controller device
+  * @refcnt: Number of gets of this pse_control
++ * @attached_phydev: PHY device pointer attached by the PSE control
+  */
+ struct pse_control {
+ 	struct pse_controller_dev *pcdev;
+@@ -29,6 +39,22 @@ struct pse_control {
+ 	struct list_head list;
+ 	unsigned int id;
+ 	struct kref refcnt;
++	struct phy_device *attached_phydev;
++};
++
++/**
++ * struct pse_power_domain - a PSE power domain
++ * @id: ID of the power domain
++ * @supply: Power supply the Power Domain
++ * @refcnt: Number of gets of this pse_power_domain
++ * @budget_eval_strategy: Current power budget evaluation strategy of the
++ *			  power domain
++ */
++struct pse_power_domain {
++	int id;
++	struct regulator *supply;
++	struct kref refcnt;
++	u32 budget_eval_strategy;
+ };
+ 
+ static int of_load_single_pse_pi_pairset(struct device_node *node,
+@@ -207,6 +233,182 @@ out:
+ 	return ret;
+ }
+ 
++/**
++ * pse_control_find_net_by_id - Find net attached to the pse control id
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ *
++ * Return: pse_control pointer or NULL. The device returned has had a
++ *	   reference added and the pointer is safe until the user calls
++ *	   pse_control_put() to indicate they have finished with it.
++ */
++static struct pse_control *
++pse_control_find_by_id(struct pse_controller_dev *pcdev, int id)
++{
++	struct pse_control *psec;
++
++	mutex_lock(&pse_list_mutex);
++	list_for_each_entry(psec, &pcdev->pse_control_head, list) {
++		if (psec->id == id) {
++			kref_get(&psec->refcnt);
++			mutex_unlock(&pse_list_mutex);
++			return psec;
++		}
++	}
++	mutex_unlock(&pse_list_mutex);
++	return NULL;
++}
++
++/**
++ * pse_control_get_netdev - Return netdev associated to a PSE control
++ * @psec: PSE control pointer
++ *
++ * Return: netdev pointer or NULL
++ */
++static struct net_device *pse_control_get_netdev(struct pse_control *psec)
++{
++	ASSERT_RTNL();
++
++	if (!psec || !psec->attached_phydev)
++		return NULL;
++
++	return psec->attached_phydev->attached_dev;
++}
++
++/**
++ * pse_pi_is_hw_enabled - Is PI enabled at the hardware level
++ * @pcdev: a pointer to the PSE controller device
++ * @id: Index of the PI
++ *
++ * Return: 1 if the PI is enabled at the hardware level, 0 if not, and
++ *	   a failure value on error
++ */
++static int pse_pi_is_hw_enabled(struct pse_controller_dev *pcdev, int id)
++{
++	struct pse_admin_state admin_state = {0};
++	int ret;
++
++	ret = pcdev->ops->pi_get_admin_state(pcdev, id, &admin_state);
++	if (ret < 0)
++		return ret;
++
++	/* PI is well enabled at the hardware level */
++	if (admin_state.podl_admin_state == ETHTOOL_PODL_PSE_ADMIN_STATE_ENABLED ||
++	    admin_state.c33_admin_state == ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED)
++		return 1;
++
++	return 0;
++}
++
++/**
++ * pse_pi_is_admin_enable_pending - Check if PI is in admin enable pending state
++ *				    which mean the power is not yet being
++ *				    delivered
++ * @pcdev: a pointer to the PSE controller device
++ * @id: Index of the PI
++ *
++ * Detects if a PI is enabled in software with a PD detected, but the hardware
++ * admin state hasn't been applied yet.
++ *
++ * This function is used in the power delivery and retry mechanisms to determine
++ * which PIs need to have power delivery attempted again.
++ *
++ * Return: true if the PI has admin enable flag set in software but not yet
++ *	   reflected in the hardware admin state, false otherwise.
++ */
++static bool
++pse_pi_is_admin_enable_pending(struct pse_controller_dev *pcdev, int id)
++{
++	int ret;
++
++	/* PI not enabled or nothing is plugged */
++	if (!pcdev->pi[id].admin_state_enabled ||
++	    !pcdev->pi[id].isr_pd_detected)
++		return false;
++
++	ret = pse_pi_is_hw_enabled(pcdev, id);
++	/* PSE PI is already enabled at hardware level */
++	if (ret == 1)
++		return false;
++
++	return true;
++}
++
++static int _pse_pi_delivery_power_sw_pw_ctrl(struct pse_controller_dev *pcdev,
++					     int id,
++					     struct netlink_ext_ack *extack);
++
++/**
++ * pse_pw_d_retry_power_delivery - Retry power delivery for pending ports in a
++ *				   PSE power domain
++ * @pcdev: a pointer to the PSE controller device
++ * @pw_d: a pointer to the PSE power domain
++ *
++ * Scans all ports in the specified power domain and attempts to enable power
++ * delivery to any ports that have admin enable state set but don't yet have
++ * hardware power enabled. Used when there are changes in connection status,
++ * admin state, or priority that might allow previously unpowered ports to
++ * receive power, especially in over-budget conditions.
++ */
++static void pse_pw_d_retry_power_delivery(struct pse_controller_dev *pcdev,
++					  struct pse_power_domain *pw_d)
++{
++	int i, ret = 0;
++
++	for (i = 0; i < pcdev->nr_lines; i++) {
++		int prio_max = pcdev->nr_lines;
++		struct netlink_ext_ack extack;
++
++		if (pcdev->pi[i].pw_d != pw_d)
++			continue;
++
++		if (!pse_pi_is_admin_enable_pending(pcdev, i))
++			continue;
++
++		/* Do not try to enable PI with a lower prio (higher value)
++		 * than one which already can't be enabled.
++		 */
++		if (pcdev->pi[i].prio > prio_max)
++			continue;
++
++		ret = _pse_pi_delivery_power_sw_pw_ctrl(pcdev, i, &extack);
++		if (ret == -ERANGE)
++			prio_max = pcdev->pi[i].prio;
++	}
++}
++
++/**
++ * pse_pw_d_is_sw_pw_control - Determine if power control is software managed
++ * @pcdev: a pointer to the PSE controller device
++ * @pw_d: a pointer to the PSE power domain
++ *
++ * This function determines whether the power control for a specific power
++ * domain is managed by software in the interrupt handler rather than directly
++ * by hardware.
++ *
++ * Software power control is active in the following cases:
++ * - When the budget evaluation strategy is set to static
++ * - When the budget evaluation strategy is disabled but the PSE controller
++ *   has an interrupt handler that can report if a Powered Device is connected
++ *
++ * Return: true if the power control of the power domain is managed by software,
++ *         false otherwise
++ */
++static bool pse_pw_d_is_sw_pw_control(struct pse_controller_dev *pcdev,
++				      struct pse_power_domain *pw_d)
++{
++	if (!pw_d)
++		return false;
++
++	if (pw_d->budget_eval_strategy == PSE_BUDGET_EVAL_STRAT_STATIC)
++		return true;
++	if (pw_d->budget_eval_strategy == PSE_BUDGET_EVAL_STRAT_DISABLED &&
++	    pcdev->ops->pi_enable && pcdev->irq)
++		return true;
++
++	return false;
++}
++
+ static int pse_pi_is_enabled(struct regulator_dev *rdev)
+ {
+ 	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
+@@ -214,22 +416,257 @@ static int pse_pi_is_enabled(struct regu
+ 	int id, ret;
+ 
+ 	ops = pcdev->ops;
+-	if (!ops->pi_is_enabled)
++	if (!ops->pi_get_admin_state)
+ 		return -EOPNOTSUPP;
+ 
+ 	id = rdev_get_id(rdev);
+ 	mutex_lock(&pcdev->lock);
+-	ret = ops->pi_is_enabled(pcdev, id);
++	if (pse_pw_d_is_sw_pw_control(pcdev, pcdev->pi[id].pw_d)) {
++		ret = pcdev->pi[id].admin_state_enabled;
++		goto out;
++	}
++
++	ret = pse_pi_is_hw_enabled(pcdev, id);
++
++out:
+ 	mutex_unlock(&pcdev->lock);
+ 
+ 	return ret;
+ }
+ 
++/**
++ * pse_pi_deallocate_pw_budget - Deallocate power budget of the PI
++ * @pi: a pointer to the PSE PI
++ */
++static void pse_pi_deallocate_pw_budget(struct pse_pi *pi)
++{
++	if (!pi->pw_d || !pi->pw_allocated_mW)
++		return;
++
++	regulator_free_power_budget(pi->pw_d->supply, pi->pw_allocated_mW);
++	pi->pw_allocated_mW = 0;
++}
++
++/**
++ * _pse_pi_disable - Call disable operation. Assumes the PSE lock has been
++ *		     acquired.
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int _pse_pi_disable(struct pse_controller_dev *pcdev, int id)
++{
++	const struct pse_controller_ops *ops = pcdev->ops;
++	int ret;
++
++	if (!ops->pi_disable)
++		return -EOPNOTSUPP;
++
++	ret = ops->pi_disable(pcdev, id);
++	if (ret)
++		return ret;
++
++	pse_pi_deallocate_pw_budget(&pcdev->pi[id]);
++
++	if (pse_pw_d_is_sw_pw_control(pcdev, pcdev->pi[id].pw_d))
++		pse_pw_d_retry_power_delivery(pcdev, pcdev->pi[id].pw_d);
++
++	return 0;
++}
++
++/**
++ * pse_disable_pi_pol - Disable a PI on a power budget policy
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE PI
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int pse_disable_pi_pol(struct pse_controller_dev *pcdev, int id)
++{
++	unsigned long notifs = ETHTOOL_PSE_EVENT_OVER_BUDGET;
++	struct pse_ntf ntf = {};
++	int ret;
++
++	dev_dbg(pcdev->dev, "Disabling PI %d to free power budget\n", id);
++
++	ret = _pse_pi_disable(pcdev, id);
++	if (ret)
++		notifs |= ETHTOOL_PSE_EVENT_SW_PW_CONTROL_ERROR;
++
++	ntf.notifs = notifs;
++	ntf.id = id;
++	kfifo_in_spinlocked(&pcdev->ntf_fifo, &ntf, 1, &pcdev->ntf_fifo_lock);
++	schedule_work(&pcdev->ntf_work);
++
++	return ret;
++}
++
++/**
++ * pse_disable_pi_prio - Disable all PIs of a given priority inside a PSE
++ *			 power domain
++ * @pcdev: a pointer to the PSE
++ * @pw_d: a pointer to the PSE power domain
++ * @prio: priority
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int pse_disable_pi_prio(struct pse_controller_dev *pcdev,
++			       struct pse_power_domain *pw_d,
++			       int prio)
++{
++	int i;
++
++	for (i = 0; i < pcdev->nr_lines; i++) {
++		int ret;
++
++		if (pcdev->pi[i].prio != prio ||
++		    pcdev->pi[i].pw_d != pw_d ||
++		    pse_pi_is_hw_enabled(pcdev, i) <= 0)
++			continue;
++
++		ret = pse_disable_pi_pol(pcdev, i);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * pse_pi_allocate_pw_budget_static_prio - Allocate power budget for the PI
++ *					   when the budget eval strategy is
++ *					   static
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ * @pw_req: power requested in mW
++ * @extack: extack for error reporting
++ *
++ * Allocates power using static budget evaluation strategy, where allocation
++ * is based on PD classification. When insufficient budget is available,
++ * lower-priority ports (higher priority numbers) are turned off first.
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int
++pse_pi_allocate_pw_budget_static_prio(struct pse_controller_dev *pcdev, int id,
++				      int pw_req, struct netlink_ext_ack *extack)
++{
++	struct pse_pi *pi = &pcdev->pi[id];
++	int ret, _prio;
++
++	_prio = pcdev->nr_lines;
++	while (regulator_request_power_budget(pi->pw_d->supply, pw_req) == -ERANGE) {
++		if (_prio <= pi->prio) {
++			NL_SET_ERR_MSG_FMT(extack,
++					   "PI %d: not enough power budget available",
++					   id);
++			return -ERANGE;
++		}
++
++		ret = pse_disable_pi_prio(pcdev, pi->pw_d, _prio);
++		if (ret < 0)
++			return ret;
++
++		_prio--;
++	}
++
++	pi->pw_allocated_mW = pw_req;
++	return 0;
++}
++
++/**
++ * pse_pi_allocate_pw_budget - Allocate power budget for the PI
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ * @pw_req: power requested in mW
++ * @extack: extack for error reporting
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int pse_pi_allocate_pw_budget(struct pse_controller_dev *pcdev, int id,
++				     int pw_req, struct netlink_ext_ack *extack)
++{
++	struct pse_pi *pi = &pcdev->pi[id];
++
++	if (!pi->pw_d)
++		return 0;
++
++	/* PSE_BUDGET_EVAL_STRAT_STATIC */
++	if (pi->pw_d->budget_eval_strategy == PSE_BUDGET_EVAL_STRAT_STATIC)
++		return pse_pi_allocate_pw_budget_static_prio(pcdev, id, pw_req,
++							     extack);
++
++	return 0;
++}
++
++/**
++ * _pse_pi_delivery_power_sw_pw_ctrl - Enable PSE PI in case of software power
++ *				       control. Assumes the PSE lock has been
++ *				       acquired.
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ * @extack: extack for error reporting
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int _pse_pi_delivery_power_sw_pw_ctrl(struct pse_controller_dev *pcdev,
++					     int id,
++					     struct netlink_ext_ack *extack)
++{
++	const struct pse_controller_ops *ops = pcdev->ops;
++	struct pse_pi *pi = &pcdev->pi[id];
++	int ret, pw_req;
++
++	if (!ops->pi_get_pw_req) {
++		/* No power allocation management */
++		ret = ops->pi_enable(pcdev, id);
++		if (ret)
++			NL_SET_ERR_MSG_FMT(extack,
++					   "PI %d: enable error %d",
++					   id, ret);
++		return ret;
++	}
++
++	ret = ops->pi_get_pw_req(pcdev, id);
++	if (ret < 0)
++		return ret;
++
++	pw_req = ret;
++
++	/* Compare requested power with port power limit and use the lowest
++	 * one.
++	 */
++	if (ops->pi_get_pw_limit) {
++		ret = ops->pi_get_pw_limit(pcdev, id);
++		if (ret < 0)
++			return ret;
++
++		if (ret < pw_req)
++			pw_req = ret;
++	}
++
++	ret = pse_pi_allocate_pw_budget(pcdev, id, pw_req, extack);
++	if (ret)
++		return ret;
++
++	ret = ops->pi_enable(pcdev, id);
++	if (ret) {
++		pse_pi_deallocate_pw_budget(pi);
++		NL_SET_ERR_MSG_FMT(extack,
++				   "PI %d: enable error %d",
++				   id, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int pse_pi_enable(struct regulator_dev *rdev)
+ {
+ 	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
+ 	const struct pse_controller_ops *ops;
+-	int id, ret;
++	int id, ret = 0;
+ 
+ 	ops = pcdev->ops;
+ 	if (!ops->pi_enable)
+@@ -237,6 +674,23 @@ static int pse_pi_enable(struct regulato
+ 
+ 	id = rdev_get_id(rdev);
+ 	mutex_lock(&pcdev->lock);
++	if (pse_pw_d_is_sw_pw_control(pcdev, pcdev->pi[id].pw_d)) {
++		/* Manage enabled status by software.
++		 * Real enable process will happen if a port is connected.
++		 */
++		if (pcdev->pi[id].isr_pd_detected) {
++			struct netlink_ext_ack extack;
++
++			ret = _pse_pi_delivery_power_sw_pw_ctrl(pcdev, id, &extack);
++		}
++		if (!ret || ret == -ERANGE) {
++			pcdev->pi[id].admin_state_enabled = 1;
++			ret = 0;
++		}
++		mutex_unlock(&pcdev->lock);
++		return ret;
++	}
++
+ 	ret = ops->pi_enable(pcdev, id);
+ 	if (!ret)
+ 		pcdev->pi[id].admin_state_enabled = 1;
+@@ -248,21 +702,18 @@ static int pse_pi_enable(struct regulato
+ static int pse_pi_disable(struct regulator_dev *rdev)
+ {
+ 	struct pse_controller_dev *pcdev = rdev_get_drvdata(rdev);
+-	const struct pse_controller_ops *ops;
++	struct pse_pi *pi;
+ 	int id, ret;
+ 
+-	ops = pcdev->ops;
+-	if (!ops->pi_disable)
+-		return -EOPNOTSUPP;
+-
+ 	id = rdev_get_id(rdev);
++	pi = &pcdev->pi[id];
+ 	mutex_lock(&pcdev->lock);
+-	ret = ops->pi_disable(pcdev, id);
++	ret = _pse_pi_disable(pcdev, id);
+ 	if (!ret)
+-		pcdev->pi[id].admin_state_enabled = 0;
+-	mutex_unlock(&pcdev->lock);
++		pi->admin_state_enabled = 0;
+ 
+-	return ret;
++	mutex_unlock(&pcdev->lock);
++	return 0;
+ }
+ 
+ static int _pse_pi_get_voltage(struct regulator_dev *rdev)
+@@ -413,6 +864,7 @@ devm_pse_pi_regulator_register(struct ps
+ 	rconfig.dev = pcdev->dev;
+ 	rconfig.driver_data = pcdev;
+ 	rconfig.init_data = rinit_data;
++	rconfig.of_node = pcdev->pi[id].np;
+ 
+ 	rdev = devm_regulator_register(pcdev->dev, rdesc, &rconfig);
+ 	if (IS_ERR(rdev)) {
+@@ -426,6 +878,158 @@ devm_pse_pi_regulator_register(struct ps
+ 	return 0;
+ }
+ 
++static void __pse_pw_d_release(struct kref *kref)
++{
++	struct pse_power_domain *pw_d = container_of(kref,
++						     struct pse_power_domain,
++						     refcnt);
++
++	regulator_put(pw_d->supply);
++	xa_erase(&pse_pw_d_map, pw_d->id);
++	mutex_unlock(&pse_pw_d_mutex);
++}
++
++/**
++ * pse_flush_pw_ds - flush all PSE power domains of a PSE
++ * @pcdev: a pointer to the initialized PSE controller device
++ */
++static void pse_flush_pw_ds(struct pse_controller_dev *pcdev)
++{
++	struct pse_power_domain *pw_d;
++	int i;
++
++	for (i = 0; i < pcdev->nr_lines; i++) {
++		if (!pcdev->pi[i].pw_d)
++			continue;
++
++		pw_d = xa_load(&pse_pw_d_map, pcdev->pi[i].pw_d->id);
++		if (!pw_d)
++			continue;
++
++		kref_put_mutex(&pw_d->refcnt, __pse_pw_d_release,
++			       &pse_pw_d_mutex);
++	}
++}
++
++/**
++ * devm_pse_alloc_pw_d - allocate a new PSE power domain for a device
++ * @dev: device that is registering this PSE power domain
++ *
++ * Return: Pointer to the newly allocated PSE power domain or error pointers
++ */
++static struct pse_power_domain *devm_pse_alloc_pw_d(struct device *dev)
++{
++	struct pse_power_domain *pw_d;
++	int index, ret;
++
++	pw_d = devm_kzalloc(dev, sizeof(*pw_d), GFP_KERNEL);
++	if (!pw_d)
++		return ERR_PTR(-ENOMEM);
++
++	ret = xa_alloc(&pse_pw_d_map, &index, pw_d, XA_LIMIT(1, PSE_PW_D_LIMIT),
++		       GFP_KERNEL);
++	if (ret)
++		return ERR_PTR(ret);
++
++	kref_init(&pw_d->refcnt);
++	pw_d->id = index;
++	return pw_d;
++}
++
++/**
++ * pse_register_pw_ds - register the PSE power domains for a PSE
++ * @pcdev: a pointer to the PSE controller device
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int pse_register_pw_ds(struct pse_controller_dev *pcdev)
++{
++	int i, ret = 0;
++
++	mutex_lock(&pse_pw_d_mutex);
++	for (i = 0; i < pcdev->nr_lines; i++) {
++		struct regulator_dev *rdev = pcdev->pi[i].rdev;
++		struct pse_power_domain *pw_d;
++		struct regulator *supply;
++		bool present = false;
++		unsigned long index;
++
++		/* No regulator or regulator parent supply registered.
++		 * We need a regulator parent to register a PSE power domain
++		 */
++		if (!rdev || !rdev->supply)
++			continue;
++
++		xa_for_each(&pse_pw_d_map, index, pw_d) {
++			/* Power supply already registered as a PSE power
++			 * domain.
++			 */
++			if (regulator_is_equal(pw_d->supply, rdev->supply)) {
++				present = true;
++				pcdev->pi[i].pw_d = pw_d;
++				break;
++			}
++		}
++		if (present) {
++			kref_get(&pw_d->refcnt);
++			continue;
++		}
++
++		pw_d = devm_pse_alloc_pw_d(pcdev->dev);
++		if (IS_ERR(pw_d)) {
++			ret = PTR_ERR(pw_d);
++			goto out;
++		}
++
++		supply = regulator_get(&rdev->dev, rdev->supply_name);
++		if (IS_ERR(supply)) {
++			xa_erase(&pse_pw_d_map, pw_d->id);
++			ret = PTR_ERR(supply);
++			goto out;
++		}
++
++		pw_d->supply = supply;
++		if (pcdev->supp_budget_eval_strategies)
++			pw_d->budget_eval_strategy = pcdev->supp_budget_eval_strategies;
++		else
++			pw_d->budget_eval_strategy = PSE_BUDGET_EVAL_STRAT_DISABLED;
++		kref_init(&pw_d->refcnt);
++		pcdev->pi[i].pw_d = pw_d;
++	}
++
++out:
++	mutex_unlock(&pse_pw_d_mutex);
++	return ret;
++}
++
++/**
++ * pse_send_ntf_worker - Worker to send PSE notifications
++ * @work: work object
++ *
++ * Manage and send PSE netlink notifications using a workqueue to avoid
++ * deadlock between pcdev_lock and pse_list_mutex.
++ */
++static void pse_send_ntf_worker(struct work_struct *work)
++{
++	struct pse_controller_dev *pcdev;
++	struct pse_ntf ntf;
++
++	pcdev = container_of(work, struct pse_controller_dev, ntf_work);
++
++	while (kfifo_out(&pcdev->ntf_fifo, &ntf, 1)) {
++		struct net_device *netdev;
++		struct pse_control *psec;
++
++		psec = pse_control_find_by_id(pcdev, ntf.id);
++		rtnl_lock();
++		netdev = pse_control_get_netdev(psec);
++		if (netdev)
++			ethnl_pse_send_ntf(netdev, ntf.notifs);
++		rtnl_unlock();
++		pse_control_put(psec);
++	}
++}
++
+ /**
+  * pse_controller_register - register a PSE controller device
+  * @pcdev: a pointer to the initialized PSE controller device
+@@ -439,10 +1043,24 @@ int pse_controller_register(struct pse_c
+ 
+ 	mutex_init(&pcdev->lock);
+ 	INIT_LIST_HEAD(&pcdev->pse_control_head);
++	spin_lock_init(&pcdev->ntf_fifo_lock);
++	ret = kfifo_alloc(&pcdev->ntf_fifo, pcdev->nr_lines, GFP_KERNEL);
++	if (ret) {
++		dev_err(pcdev->dev, "failed to allocate kfifo notifications\n");
++		return ret;
++	}
++	INIT_WORK(&pcdev->ntf_work, pse_send_ntf_worker);
+ 
+ 	if (!pcdev->nr_lines)
+ 		pcdev->nr_lines = 1;
+ 
++	if (!pcdev->ops->pi_get_admin_state ||
++	    !pcdev->ops->pi_get_pw_status) {
++		dev_err(pcdev->dev,
++			"Mandatory status report callbacks are missing");
++		return -EINVAL;
++	}
++
+ 	ret = of_load_pse_pis(pcdev);
+ 	if (ret)
+ 		return ret;
+@@ -478,6 +1096,10 @@ int pse_controller_register(struct pse_c
+ 			return ret;
+ 	}
+ 
++	ret = pse_register_pw_ds(pcdev);
++	if (ret)
++		return ret;
++
+ 	mutex_lock(&pse_list_mutex);
+ 	list_add(&pcdev->list, &pse_controller_list);
+ 	mutex_unlock(&pse_list_mutex);
+@@ -492,7 +1114,12 @@ EXPORT_SYMBOL_GPL(pse_controller_registe
+  */
+ void pse_controller_unregister(struct pse_controller_dev *pcdev)
+ {
++	pse_flush_pw_ds(pcdev);
+ 	pse_release_pis(pcdev);
++	if (pcdev->irq)
++		disable_irq(pcdev->irq);
++	cancel_work_sync(&pcdev->ntf_work);
++	kfifo_free(&pcdev->ntf_fifo);
+ 	mutex_lock(&pse_list_mutex);
+ 	list_del(&pcdev->list);
+ 	mutex_unlock(&pse_list_mutex);
+@@ -539,6 +1166,191 @@ int devm_pse_controller_register(struct
+ }
+ EXPORT_SYMBOL_GPL(devm_pse_controller_register);
+ 
++struct pse_irq {
++	struct pse_controller_dev *pcdev;
++	struct pse_irq_desc desc;
++	unsigned long *notifs;
++};
++
++/**
++ * pse_to_regulator_notifs - Convert PSE notifications to Regulator
++ *			     notifications
++ * @notifs: PSE notifications
++ *
++ * Return: Regulator notifications
++ */
++static unsigned long pse_to_regulator_notifs(unsigned long notifs)
++{
++	unsigned long rnotifs = 0;
++
++	if (notifs & ETHTOOL_PSE_EVENT_OVER_CURRENT)
++		rnotifs |= REGULATOR_EVENT_OVER_CURRENT;
++	if (notifs & ETHTOOL_PSE_EVENT_OVER_TEMP)
++		rnotifs |= REGULATOR_EVENT_OVER_TEMP;
++
++	return rnotifs;
++}
++
++/**
++ * pse_set_config_isr - Set PSE control config according to the PSE
++ *			notifications
++ * @pcdev: a pointer to the PSE
++ * @id: index of the PSE control
++ * @notifs: PSE event notifications
++ *
++ * Return: 0 on success and failure value on error
++ */
++static int pse_set_config_isr(struct pse_controller_dev *pcdev, int id,
++			      unsigned long notifs)
++{
++	int ret = 0;
++
++	if (notifs & PSE_BUDGET_EVAL_STRAT_DYNAMIC)
++		return 0;
++
++	if ((notifs & ETHTOOL_C33_PSE_EVENT_DISCONNECTION) &&
++	    ((notifs & ETHTOOL_C33_PSE_EVENT_DETECTION) ||
++	     (notifs & ETHTOOL_C33_PSE_EVENT_CLASSIFICATION))) {
++		dev_dbg(pcdev->dev,
++			"PI %d: error, connection and disconnection reported simultaneously",
++			id);
++		return -EINVAL;
++	}
++
++	if (notifs & ETHTOOL_C33_PSE_EVENT_CLASSIFICATION) {
++		struct netlink_ext_ack extack;
++
++		pcdev->pi[id].isr_pd_detected = true;
++		if (pcdev->pi[id].admin_state_enabled) {
++			ret = _pse_pi_delivery_power_sw_pw_ctrl(pcdev, id,
++								&extack);
++			if (ret == -ERANGE)
++				ret = 0;
++		}
++	} else if (notifs & ETHTOOL_C33_PSE_EVENT_DISCONNECTION) {
++		if (pcdev->pi[id].admin_state_enabled &&
++		    pcdev->pi[id].isr_pd_detected)
++			ret = _pse_pi_disable(pcdev, id);
++		pcdev->pi[id].isr_pd_detected = false;
++	}
++
++	return ret;
++}
++
++/**
++ * pse_isr - IRQ handler for PSE
++ * @irq: irq number
++ * @data: pointer to user interrupt structure
++ *
++ * Return: irqreturn_t - status of IRQ
++ */
++static irqreturn_t pse_isr(int irq, void *data)
++{
++	struct pse_controller_dev *pcdev;
++	unsigned long notifs_mask = 0;
++	struct pse_irq_desc *desc;
++	struct pse_irq *h = data;
++	int ret, i;
++
++	desc = &h->desc;
++	pcdev = h->pcdev;
++
++	/* Clear notifs mask */
++	memset(h->notifs, 0, pcdev->nr_lines * sizeof(*h->notifs));
++	mutex_lock(&pcdev->lock);
++	ret = desc->map_event(irq, pcdev, h->notifs, &notifs_mask);
++	if (ret || !notifs_mask) {
++		mutex_unlock(&pcdev->lock);
++		return IRQ_NONE;
++	}
++
++	for_each_set_bit(i, &notifs_mask, pcdev->nr_lines) {
++		unsigned long notifs, rnotifs;
++		struct pse_ntf ntf = {};
++
++		/* Do nothing PI not described */
++		if (!pcdev->pi[i].rdev)
++			continue;
++
++		notifs = h->notifs[i];
++		if (pse_pw_d_is_sw_pw_control(pcdev, pcdev->pi[i].pw_d)) {
++			ret = pse_set_config_isr(pcdev, i, notifs);
++			if (ret)
++				notifs |= ETHTOOL_PSE_EVENT_SW_PW_CONTROL_ERROR;
++		}
++
++		dev_dbg(h->pcdev->dev,
++			"Sending PSE notification EVT 0x%lx\n", notifs);
++
++		ntf.notifs = notifs;
++		ntf.id = i;
++		kfifo_in_spinlocked(&pcdev->ntf_fifo, &ntf, 1,
++				    &pcdev->ntf_fifo_lock);
++		schedule_work(&pcdev->ntf_work);
++
++		rnotifs = pse_to_regulator_notifs(notifs);
++		regulator_notifier_call_chain(pcdev->pi[i].rdev, rnotifs,
++					      NULL);
++	}
++
++	mutex_unlock(&pcdev->lock);
++
++	return IRQ_HANDLED;
++}
++
++/**
++ * devm_pse_irq_helper - Register IRQ based PSE event notifier
++ * @pcdev: a pointer to the PSE
++ * @irq: the irq value to be passed to request_irq
++ * @irq_flags: the flags to be passed to request_irq
++ * @d: PSE interrupt description
++ *
++ * Return: 0 on success and errno on failure
++ */
++int devm_pse_irq_helper(struct pse_controller_dev *pcdev, int irq,
++			int irq_flags, const struct pse_irq_desc *d)
++{
++	struct device *dev = pcdev->dev;
++	size_t irq_name_len;
++	struct pse_irq *h;
++	char *irq_name;
++	int ret;
++
++	if (!d || !d->map_event || !d->name)
++		return -EINVAL;
++
++	h = devm_kzalloc(dev, sizeof(*h), GFP_KERNEL);
++	if (!h)
++		return -ENOMEM;
++
++	h->pcdev = pcdev;
++	h->desc = *d;
++
++	/* IRQ name len is pcdev dev name + 5 char + irq desc name + 1 */
++	irq_name_len = strlen(dev_name(pcdev->dev)) + 5 + strlen(d->name) + 1;
++	irq_name = devm_kzalloc(dev, irq_name_len, GFP_KERNEL);
++	if (!irq_name)
++		return -ENOMEM;
++
++	snprintf(irq_name, irq_name_len, "pse-%s:%s", dev_name(pcdev->dev),
++		 d->name);
++
++	h->notifs = devm_kcalloc(dev, pcdev->nr_lines,
++				 sizeof(*h->notifs), GFP_KERNEL);
++	if (!h->notifs)
++		return -ENOMEM;
++
++	ret = devm_request_threaded_irq(dev, irq, NULL, pse_isr,
++					IRQF_ONESHOT | irq_flags,
++					irq_name, h);
++	if (ret)
++		dev_err(pcdev->dev, "Failed to request IRQ %d\n", irq);
++
++	pcdev->irq = irq;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(devm_pse_irq_helper);
++
+ /* PSE control section */
+ 
+ static void __pse_control_release(struct kref *kref)
+@@ -581,7 +1393,8 @@ void pse_control_put(struct pse_control
+ EXPORT_SYMBOL_GPL(pse_control_put);
+ 
+ static struct pse_control *
+-pse_control_get_internal(struct pse_controller_dev *pcdev, unsigned int index)
++pse_control_get_internal(struct pse_controller_dev *pcdev, unsigned int index,
++			 struct phy_device *phydev)
+ {
+ 	struct pse_control *psec;
+ 	int ret;
+@@ -604,6 +1417,20 @@ pse_control_get_internal(struct pse_cont
+ 		goto free_psec;
+ 	}
+ 
++	if (!pcdev->ops->pi_get_admin_state) {
++		ret = -EOPNOTSUPP;
++		goto free_psec;
++	}
++
++	/* Initialize admin_state_enabled before the regulator_get. This
++	 * aims to have the right value reported in the first is_enabled
++	 * call in case of control managed by software.
++	 */
++	ret = pse_pi_is_hw_enabled(pcdev, index);
++	if (ret < 0)
++		goto free_psec;
++
++	pcdev->pi[index].admin_state_enabled = ret;
+ 	psec->ps = devm_regulator_get_exclusive(pcdev->dev,
+ 						rdev_get_name(pcdev->pi[index].rdev));
+ 	if (IS_ERR(psec->ps)) {
+@@ -611,21 +1438,14 @@ pse_control_get_internal(struct pse_cont
+ 		goto put_module;
+ 	}
+ 
+-	ret = regulator_is_enabled(psec->ps);
+-	if (ret < 0)
+-		goto regulator_put;
+-
+-	pcdev->pi[index].admin_state_enabled = ret;
+-
+ 	psec->pcdev = pcdev;
+ 	list_add(&psec->list, &pcdev->pse_control_head);
+ 	psec->id = index;
++	psec->attached_phydev = phydev;
+ 	kref_init(&psec->refcnt);
+ 
+ 	return psec;
+ 
+-regulator_put:
+-	devm_regulator_put(psec->ps);
+ put_module:
+ 	module_put(pcdev->owner);
+ free_psec:
+@@ -675,7 +1495,8 @@ static int psec_id_xlate(struct pse_cont
+ 	return pse_spec->args[0];
+ }
+ 
+-struct pse_control *of_pse_control_get(struct device_node *node)
++struct pse_control *of_pse_control_get(struct device_node *node,
++				       struct phy_device *phydev)
+ {
+ 	struct pse_controller_dev *r, *pcdev;
+ 	struct of_phandle_args args;
+@@ -725,7 +1546,7 @@ struct pse_control *of_pse_control_get(s
+ 	}
+ 
+ 	/* pse_list_mutex also protects the pcdev's pse_control list */
+-	psec = pse_control_get_internal(pcdev, psec_id);
++	psec = pse_control_get_internal(pcdev, psec_id, phydev);
+ 
+ out:
+ 	mutex_unlock(&pse_list_mutex);
+@@ -736,6 +1557,35 @@ out:
+ EXPORT_SYMBOL_GPL(of_pse_control_get);
+ 
+ /**
++ * pse_get_sw_admin_state - Convert the software admin state to c33 or podl
++ *			    admin state value used in the standard
++ * @psec: PSE control pointer
++ * @admin_state: a pointer to the admin_state structure
++ */
++static void pse_get_sw_admin_state(struct pse_control *psec,
++				   struct pse_admin_state *admin_state)
++{
++	struct pse_pi *pi = &psec->pcdev->pi[psec->id];
++
++	if (pse_has_podl(psec)) {
++		if (pi->admin_state_enabled)
++			admin_state->podl_admin_state =
++				ETHTOOL_PODL_PSE_ADMIN_STATE_ENABLED;
++		else
++			admin_state->podl_admin_state =
++				ETHTOOL_PODL_PSE_ADMIN_STATE_DISABLED;
++	}
++	if (pse_has_c33(psec)) {
++		if (pi->admin_state_enabled)
++			admin_state->c33_admin_state =
++				ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
++		else
++			admin_state->c33_admin_state =
++				ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++	}
++}
++
++/**
+  * pse_ethtool_get_status - get status of PSE control
+  * @psec: PSE control pointer
+  * @extack: extack for reporting useful error messages
+@@ -745,25 +1595,111 @@ EXPORT_SYMBOL_GPL(of_pse_control_get);
+  */
+ int pse_ethtool_get_status(struct pse_control *psec,
+ 			   struct netlink_ext_ack *extack,
+-			   struct pse_control_status *status)
++			   struct ethtool_pse_control_status *status)
+ {
++	struct pse_admin_state admin_state = {0};
++	struct pse_pw_status pw_status = {0};
+ 	const struct pse_controller_ops *ops;
+ 	struct pse_controller_dev *pcdev;
+-	int err;
++	struct pse_pi *pi;
++	int ret;
+ 
+ 	pcdev = psec->pcdev;
+ 	ops = pcdev->ops;
+-	if (!ops->ethtool_get_status) {
+-		NL_SET_ERR_MSG(extack,
+-			       "PSE driver does not support status report");
+-		return -EOPNOTSUPP;
+-	}
+ 
++	pi = &pcdev->pi[psec->id];
+ 	mutex_lock(&pcdev->lock);
+-	err = ops->ethtool_get_status(pcdev, psec->id, extack, status);
+-	mutex_unlock(&pcdev->lock);
++	if (pi->pw_d) {
++		status->pw_d_id = pi->pw_d->id;
++		if (pse_pw_d_is_sw_pw_control(pcdev, pi->pw_d)) {
++			pse_get_sw_admin_state(psec, &admin_state);
++		} else {
++			ret = ops->pi_get_admin_state(pcdev, psec->id,
++						      &admin_state);
++			if (ret)
++				goto out;
++		}
++		status->podl_admin_state = admin_state.podl_admin_state;
++		status->c33_admin_state = admin_state.c33_admin_state;
+ 
+-	return err;
++		switch (pi->pw_d->budget_eval_strategy) {
++		case PSE_BUDGET_EVAL_STRAT_STATIC:
++			status->prio_max = pcdev->nr_lines - 1;
++			status->prio = pi->prio;
++			break;
++		case PSE_BUDGET_EVAL_STRAT_DYNAMIC:
++			status->prio_max = pcdev->pis_prio_max;
++			if (ops->pi_get_prio) {
++				ret = ops->pi_get_prio(pcdev, psec->id);
++				if (ret < 0)
++					goto out;
++
++				status->prio = ret;
++			}
++			break;
++		default:
++			break;
++		}
++	}
++
++	ret = ops->pi_get_pw_status(pcdev, psec->id, &pw_status);
++	if (ret)
++		goto out;
++	status->podl_pw_status = pw_status.podl_pw_status;
++	status->c33_pw_status = pw_status.c33_pw_status;
++
++	if (ops->pi_get_ext_state) {
++		struct pse_ext_state_info ext_state_info = {0};
++
++		ret = ops->pi_get_ext_state(pcdev, psec->id,
++					    &ext_state_info);
++		if (ret)
++			goto out;
++
++		memcpy(&status->c33_ext_state_info,
++		       &ext_state_info.c33_ext_state_info,
++		       sizeof(status->c33_ext_state_info));
++	}
++
++	if (ops->pi_get_pw_class) {
++		ret = ops->pi_get_pw_class(pcdev, psec->id);
++		if (ret < 0)
++			goto out;
++
++		status->c33_pw_class = ret;
++	}
++
++	if (ops->pi_get_actual_pw) {
++		ret = ops->pi_get_actual_pw(pcdev, psec->id);
++		if (ret < 0)
++			goto out;
++
++		status->c33_actual_pw = ret;
++	}
++
++	if (ops->pi_get_pw_limit) {
++		ret = ops->pi_get_pw_limit(pcdev, psec->id);
++		if (ret < 0)
++			goto out;
++
++		status->c33_avail_pw_limit = ret;
++	}
++
++	if (ops->pi_get_pw_limit_ranges) {
++		struct pse_pw_limit_ranges pw_limit_ranges = {0};
++
++		ret = ops->pi_get_pw_limit_ranges(pcdev, psec->id,
++						  &pw_limit_ranges);
++		if (ret < 0)
++			goto out;
++
++		status->c33_pw_limit_ranges =
++			pw_limit_ranges.c33_pw_limit_ranges;
++		status->c33_pw_limit_nb_ranges = ret;
++	}
++out:
++	mutex_unlock(&psec->pcdev->lock);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(pse_ethtool_get_status);
+ 
+@@ -854,6 +1790,52 @@ int pse_ethtool_set_config(struct pse_co
+ EXPORT_SYMBOL_GPL(pse_ethtool_set_config);
+ 
+ /**
++ * pse_pi_update_pw_budget - Update PSE power budget allocated with new
++ *			     power in mW
++ * @pcdev: a pointer to the PSE controller device
++ * @id: index of the PSE PI
++ * @pw_req: power requested
++ * @extack: extack for reporting useful error messages
++ *
++ * Return: Previous power allocated on success and failure value on error
++ */
++static int pse_pi_update_pw_budget(struct pse_controller_dev *pcdev, int id,
++				   const unsigned int pw_req,
++				   struct netlink_ext_ack *extack)
++{
++	struct pse_pi *pi = &pcdev->pi[id];
++	int previous_pw_allocated;
++	int pw_diff, ret = 0;
++
++	/* We don't want pw_allocated_mW value change in the middle of an
++	 * power budget update
++	 */
++	mutex_lock(&pcdev->lock);
++	previous_pw_allocated = pi->pw_allocated_mW;
++	pw_diff = pw_req - previous_pw_allocated;
++	if (!pw_diff) {
++		goto out;
++	} else if (pw_diff > 0) {
++		ret = regulator_request_power_budget(pi->pw_d->supply, pw_diff);
++		if (ret) {
++			NL_SET_ERR_MSG_FMT(extack,
++					   "PI %d: not enough power budget available",
++					   id);
++			goto out;
++		}
++
++	} else {
++		regulator_free_power_budget(pi->pw_d->supply, -pw_diff);
++	}
++	pi->pw_allocated_mW = pw_req;
++	ret = previous_pw_allocated;
++
++out:
++	mutex_unlock(&pcdev->lock);
++	return ret;
++}
++
++/**
+  * pse_ethtool_set_pw_limit - set PSE control power limit
+  * @psec: PSE control pointer
+  * @extack: extack for reporting useful error messages
+@@ -865,9 +1847,12 @@ int pse_ethtool_set_pw_limit(struct pse_
+ 			     struct netlink_ext_ack *extack,
+ 			     const unsigned int pw_limit)
+ {
+-	int uV, uA, ret;
++	int uV, uA, ret, previous_pw_allocated = 0;
+ 	s64 tmp_64;
+ 
++	if (pw_limit > MAX_PI_PW)
++		return -ERANGE;
++
+ 	ret = regulator_get_voltage(psec->ps);
+ 	if (!ret) {
+ 		NL_SET_ERR_MSG(extack,
+@@ -886,10 +1871,100 @@ int pse_ethtool_set_pw_limit(struct pse_
+ 	/* uA = mW * 1000000000 / uV */
+ 	uA = DIV_ROUND_CLOSEST_ULL(tmp_64, uV);
+ 
+-	return regulator_set_current_limit(psec->ps, 0, uA);
++	/* Update power budget only in software power control case and
++	 * if a Power Device is powered.
++	 */
++	if (pse_pw_d_is_sw_pw_control(psec->pcdev,
++				      psec->pcdev->pi[psec->id].pw_d) &&
++	    psec->pcdev->pi[psec->id].admin_state_enabled &&
++	    psec->pcdev->pi[psec->id].isr_pd_detected) {
++		ret = pse_pi_update_pw_budget(psec->pcdev, psec->id,
++					      pw_limit, extack);
++		if (ret < 0)
++			return ret;
++		previous_pw_allocated = ret;
++	}
++
++	ret = regulator_set_current_limit(psec->ps, 0, uA);
++	if (ret < 0 && previous_pw_allocated) {
++		pse_pi_update_pw_budget(psec->pcdev, psec->id,
++					previous_pw_allocated, extack);
++	}
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(pse_ethtool_set_pw_limit);
+ 
++/**
++ * pse_ethtool_set_prio - Set PSE PI priority according to the budget
++ *			  evaluation strategy
++ * @psec: PSE control pointer
++ * @extack: extack for reporting useful error messages
++ * @prio: priovity value
++ *
++ * Return: 0 on success and failure value on error
++ */
++int pse_ethtool_set_prio(struct pse_control *psec,
++			 struct netlink_ext_ack *extack,
++			 unsigned int prio)
++{
++	struct pse_controller_dev *pcdev = psec->pcdev;
++	const struct pse_controller_ops *ops;
++	int ret = 0;
++
++	if (!pcdev->pi[psec->id].pw_d) {
++		NL_SET_ERR_MSG(extack, "no power domain attached");
++		return -EOPNOTSUPP;
++	}
++
++	/* We don't want priority change in the middle of an
++	 * enable/disable call or a priority mode change
++	 */
++	mutex_lock(&pcdev->lock);
++	switch (pcdev->pi[psec->id].pw_d->budget_eval_strategy) {
++	case PSE_BUDGET_EVAL_STRAT_STATIC:
++		if (prio >= pcdev->nr_lines) {
++			NL_SET_ERR_MSG_FMT(extack,
++					   "priority %d exceed priority max %d",
++					   prio, pcdev->nr_lines);
++			ret = -ERANGE;
++			goto out;
++		}
++
++		pcdev->pi[psec->id].prio = prio;
++		pse_pw_d_retry_power_delivery(pcdev, pcdev->pi[psec->id].pw_d);
++		break;
++
++	case PSE_BUDGET_EVAL_STRAT_DYNAMIC:
++		ops = psec->pcdev->ops;
++		if (!ops->pi_set_prio) {
++			NL_SET_ERR_MSG(extack,
++				       "pse driver does not support setting port priority");
++			ret = -EOPNOTSUPP;
++			goto out;
++		}
++
++		if (prio > pcdev->pis_prio_max) {
++			NL_SET_ERR_MSG_FMT(extack,
++					   "priority %d exceed priority max %d",
++					   prio, pcdev->pis_prio_max);
++			ret = -ERANGE;
++			goto out;
++		}
++
++		ret = ops->pi_set_prio(pcdev, psec->id, prio);
++		break;
++
++	default:
++		ret = -EOPNOTSUPP;
++	}
++
++out:
++	mutex_unlock(&pcdev->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pse_ethtool_set_prio);
++
+ bool pse_has_podl(struct pse_control *psec)
+ {
+ 	return psec->pcdev->types & ETHTOOL_PSE_PODL;
+--- a/drivers/net/pse-pd/pse_regulator.c
++++ b/drivers/net/pse-pd/pse_regulator.c
+@@ -52,17 +52,19 @@ pse_reg_pi_disable(struct pse_controller
+ }
+ 
+ static int
+-pse_reg_pi_is_enabled(struct pse_controller_dev *pcdev, int id)
++pse_reg_pi_get_admin_state(struct pse_controller_dev *pcdev, int id,
++			   struct pse_admin_state *admin_state)
+ {
+ 	struct pse_reg_priv *priv = to_pse_reg(pcdev);
+ 
+-	return regulator_is_enabled(priv->ps);
++	admin_state->podl_admin_state = priv->admin_state;
++
++	return 0;
+ }
+ 
+ static int
+-pse_reg_ethtool_get_status(struct pse_controller_dev *pcdev, unsigned long id,
+-			   struct netlink_ext_ack *extack,
+-			   struct pse_control_status *status)
++pse_reg_pi_get_pw_status(struct pse_controller_dev *pcdev, int id,
++			 struct pse_pw_status *pw_status)
+ {
+ 	struct pse_reg_priv *priv = to_pse_reg(pcdev);
+ 	int ret;
+@@ -72,20 +74,19 @@ pse_reg_ethtool_get_status(struct pse_co
+ 		return ret;
+ 
+ 	if (!ret)
+-		status->podl_pw_status = ETHTOOL_PODL_PSE_PW_D_STATUS_DISABLED;
++		pw_status->podl_pw_status =
++			ETHTOOL_PODL_PSE_PW_D_STATUS_DISABLED;
+ 	else
+-		status->podl_pw_status =
++		pw_status->podl_pw_status =
+ 			ETHTOOL_PODL_PSE_PW_D_STATUS_DELIVERING;
+ 
+-	status->podl_admin_state = priv->admin_state;
+-
+ 	return 0;
+ }
+ 
+ static const struct pse_controller_ops pse_reg_ops = {
+-	.ethtool_get_status = pse_reg_ethtool_get_status,
++	.pi_get_admin_state = pse_reg_pi_get_admin_state,
++	.pi_get_pw_status = pse_reg_pi_get_pw_status,
+ 	.pi_enable = pse_reg_pi_enable,
+-	.pi_is_enabled = pse_reg_pi_is_enabled,
+ 	.pi_disable = pse_reg_pi_disable,
+ };
+ 
+--- a/drivers/net/pse-pd/tps23881.c
++++ b/drivers/net/pse-pd/tps23881.c
+@@ -16,29 +16,59 @@
+ #include <linux/pse-pd/pse.h>
+ 
+ #define TPS23881_MAX_CHANS 8
++#define TPS23881_MAX_IRQ_RETRIES 10
+ 
++#define TPS23881_REG_IT		0x0
++#define TPS23881_REG_IT_MASK	0x1
++#define TPS23881_REG_IT_DISF	BIT(2)
++#define TPS23881_REG_IT_DETC	BIT(3)
++#define TPS23881_REG_IT_CLASC	BIT(4)
++#define TPS23881_REG_IT_IFAULT	BIT(5)
++#define TPS23881_REG_IT_SUPF	BIT(7)
++#define TPS23881_REG_DET_EVENT	0x5
++#define TPS23881_REG_FAULT	0x7
++#define TPS23881_REG_SUPF_EVENT	0xb
++#define TPS23881_REG_TSD	BIT(7)
++#define TPS23881_REG_DISC	0xc
+ #define TPS23881_REG_PW_STATUS	0x10
+ #define TPS23881_REG_OP_MODE	0x12
++#define TPS23881_REG_DISC_EN	0x13
+ #define TPS23881_OP_MODE_SEMIAUTO	0xaaaa
+ #define TPS23881_REG_DIS_EN	0x13
+ #define TPS23881_REG_DET_CLA_EN	0x14
+ #define TPS23881_REG_GEN_MASK	0x17
++#define TPS23881_REG_CLCHE	BIT(2)
++#define TPS23881_REG_DECHE	BIT(3)
+ #define TPS23881_REG_NBITACC	BIT(5)
++#define TPS23881_REG_INTEN	BIT(7)
+ #define TPS23881_REG_PW_EN	0x19
++#define TPS23881_REG_RESET	0x1a
++#define TPS23881_REG_CLRAIN	BIT(7)
++#define TPS23881_REG_2PAIR_POL1	0x1e
+ #define TPS23881_REG_PORT_MAP	0x26
+ #define TPS23881_REG_PORT_POWER	0x29
+-#define TPS23881_REG_POEPLUS	0x40
++#define TPS23881_REG_4PAIR_POL1	0x2a
++#define TPS23881_REG_INPUT_V	0x2e
++#define TPS23881_REG_CHAN1_A	0x30
++#define TPS23881_REG_CHAN1_V	0x32
++#define TPS23881_REG_FOLDBACK	0x40
+ #define TPS23881_REG_TPON	BIT(0)
+ #define TPS23881_REG_FWREV	0x41
+ #define TPS23881_REG_DEVID	0x43
+-#define TPS23881_REG_DEVID_MASK	0xF0
+-#define TPS23881_DEVICE_ID	0x02
++#define TPS23881_REG_CHAN1_CLASS	0x4c
+ #define TPS23881_REG_SRAM_CTRL	0x60
+ #define TPS23881_REG_SRAM_DATA	0x61
+ 
++#define TPS23881_UV_STEP	3662
++#define TPS23881_NA_STEP	89500
++#define TPS23881_MW_STEP	500
++#define TPS23881_MIN_PI_PW_LIMIT_MW	2000
++
+ struct tps23881_port_desc {
+ 	u8 chan[2];
+ 	bool is_4p;
++	int pw_pol;
++	bool exist;
+ };
+ 
+ struct tps23881_priv {
+@@ -53,6 +83,103 @@ static struct tps23881_priv *to_tps23881
+ 	return container_of(pcdev, struct tps23881_priv, pcdev);
+ }
+ 
++/*
++ * Helper to extract a value from a u16 register value, which is made of two
++ * u8 registers. The function calculates the bit offset based on the channel
++ * and extracts the relevant bits using a provided field mask.
++ *
++ * @param reg_val: The u16 register value (composed of two u8 registers).
++ * @param chan: The channel number (0-7).
++ * @param field_offset: The base bit offset to apply (e.g., 0 or 4).
++ * @param field_mask: The mask to apply to extract the required bits.
++ * @return: The extracted value for the specific channel.
++ */
++static u16 tps23881_calc_val(u16 reg_val, u8 chan, u8 field_offset,
++			     u16 field_mask)
++{
++	if (chan >= 4)
++		reg_val >>= 8;
++
++	return (reg_val >> field_offset) & field_mask;
++}
++
++/*
++ * Helper to combine individual channel values into a u16 register value.
++ * The function sets the value for a specific channel in the appropriate
++ * position.
++ *
++ * @param reg_val: The current u16 register value.
++ * @param chan: The channel number (0-7).
++ * @param field_offset: The base bit offset to apply (e.g., 0 or 4).
++ * @param field_mask: The mask to apply for the field (e.g., 0x0F).
++ * @param field_val: The value to set for the specific channel (masked by
++ *                   field_mask).
++ * @return: The updated u16 register value with the channel value set.
++ */
++static u16 tps23881_set_val(u16 reg_val, u8 chan, u8 field_offset,
++			    u16 field_mask, u16 field_val)
++{
++	field_val &= field_mask;
++
++	if (chan < 4) {
++		reg_val &= ~(field_mask << field_offset);
++		reg_val |= (field_val << field_offset);
++	} else {
++		reg_val &= ~(field_mask << (field_offset + 8));
++		reg_val |= (field_val << (field_offset + 8));
++	}
++
++	return reg_val;
++}
++
++static int
++tps23881_pi_set_pw_pol_limit(struct tps23881_priv *priv, int id, u8 pw_pol,
++			     bool is_4p)
++{
++	struct i2c_client *client = priv->client;
++	int ret, reg;
++	u16 val;
++	u8 chan;
++
++	chan = priv->port[id].chan[0];
++	if (!is_4p) {
++		reg = TPS23881_REG_2PAIR_POL1 + (chan % 4);
++	} else {
++		/* One chan is enough to configure the 4p PI power limit */
++		if ((chan % 4) < 2)
++			reg = TPS23881_REG_4PAIR_POL1;
++		else
++			reg = TPS23881_REG_4PAIR_POL1 + 1;
++	}
++
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	val = tps23881_set_val(ret, chan, 0, 0xff, pw_pol);
++	return i2c_smbus_write_word_data(client, reg, val);
++}
++
++static int tps23881_pi_enable_manual_pol(struct tps23881_priv *priv, int id)
++{
++	struct i2c_client *client = priv->client;
++	int ret;
++	u8 chan;
++	u16 val;
++
++	ret = i2c_smbus_read_byte_data(client, TPS23881_REG_FOLDBACK);
++	if (ret < 0)
++		return ret;
++
++	/* No need to test if the chan is PoE4 as setting either bit for a
++	 * 4P configured port disables the automatic configuration on both
++	 * channels.
++	 */
++	chan = priv->port[id].chan[0];
++	val = tps23881_set_val(ret, chan, 0, BIT(chan % 4), BIT(chan % 4));
++	return i2c_smbus_write_byte_data(client, TPS23881_REG_FOLDBACK, val);
++}
++
+ static int tps23881_pi_enable(struct pse_controller_dev *pcdev, int id)
+ {
+ 	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
+@@ -65,23 +192,29 @@ static int tps23881_pi_enable(struct pse
+ 		return -ERANGE;
+ 
+ 	chan = priv->port[id].chan[0];
+-	if (chan < 4)
+-		val = BIT(chan);
+-	else
+-		val = BIT(chan + 4);
++	val = tps23881_set_val(0, chan, 0, BIT(chan % 4), BIT(chan % 4));
+ 
+ 	if (priv->port[id].is_4p) {
+ 		chan = priv->port[id].chan[1];
+-		if (chan < 4)
+-			val |= BIT(chan);
+-		else
+-			val |= BIT(chan + 4);
++		val = tps23881_set_val(val, chan, 0, BIT(chan % 4),
++				       BIT(chan % 4));
+ 	}
+ 
+ 	ret = i2c_smbus_write_word_data(client, TPS23881_REG_PW_EN, val);
+ 	if (ret)
+ 		return ret;
+ 
++	/* Enable DC disconnect*/
++	chan = priv->port[id].chan[0];
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_DISC_EN);
++	if (ret < 0)
++		return ret;
++
++	val = tps23881_set_val(ret, chan, 0, BIT(chan % 4), BIT(chan % 4));
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_DISC_EN, val);
++	if (ret)
++		return ret;
++
+ 	return 0;
+ }
+ 
+@@ -97,32 +230,78 @@ static int tps23881_pi_disable(struct ps
+ 		return -ERANGE;
+ 
+ 	chan = priv->port[id].chan[0];
+-	if (chan < 4)
+-		val = BIT(chan + 4);
+-	else
+-		val = BIT(chan + 8);
++	val = tps23881_set_val(0, chan, 4, BIT(chan % 4), BIT(chan % 4));
+ 
+ 	if (priv->port[id].is_4p) {
+ 		chan = priv->port[id].chan[1];
+-		if (chan < 4)
+-			val |= BIT(chan + 4);
+-		else
+-			val |= BIT(chan + 8);
++		val = tps23881_set_val(val, chan, 4, BIT(chan % 4),
++				       BIT(chan % 4));
+ 	}
+ 
+ 	ret = i2c_smbus_write_word_data(client, TPS23881_REG_PW_EN, val);
+ 	if (ret)
+ 		return ret;
+ 
+-	return 0;
++	/* PWOFF command resets lots of register which need to be
++	 * configured again. According to the datasheet "It may take upwards
++	 * of 5ms after PWOFFn command for all register values to be updated"
++	 */
++	mdelay(5);
++
++	/* Disable DC disconnect*/
++	chan = priv->port[id].chan[0];
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_DISC_EN);
++	if (ret < 0)
++		return ret;
++
++	val = tps23881_set_val(ret, chan, 0, 0, BIT(chan % 4));
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_DISC_EN, val);
++	if (ret)
++		return ret;
++
++	/* Enable detection and classification */
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_DET_CLA_EN);
++	if (ret < 0)
++		return ret;
++
++	chan = priv->port[id].chan[0];
++	val = tps23881_set_val(ret, chan, 0, BIT(chan % 4), BIT(chan % 4));
++	val = tps23881_set_val(val, chan, 4, BIT(chan % 4), BIT(chan % 4));
++
++	if (priv->port[id].is_4p) {
++		chan = priv->port[id].chan[1];
++		val = tps23881_set_val(ret, chan, 0, BIT(chan % 4),
++				       BIT(chan % 4));
++		val = tps23881_set_val(val, chan, 4, BIT(chan % 4),
++				       BIT(chan % 4));
++	}
++
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_DET_CLA_EN, val);
++	if (ret)
++		return ret;
++
++	/* No power policy */
++	if (priv->port[id].pw_pol < 0)
++		return 0;
++
++	ret = tps23881_pi_enable_manual_pol(priv, id);
++	if (ret < 0)
++		return ret;
++
++	/* Set power policy */
++	return tps23881_pi_set_pw_pol_limit(priv, id, priv->port[id].pw_pol,
++					    priv->port[id].is_4p);
+ }
+ 
+-static int tps23881_pi_is_enabled(struct pse_controller_dev *pcdev, int id)
++static int
++tps23881_pi_get_admin_state(struct pse_controller_dev *pcdev, int id,
++			    struct pse_admin_state *admin_state)
+ {
+ 	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
+ 	struct i2c_client *client = priv->client;
+ 	bool enabled;
+ 	u8 chan;
++	u16 val;
+ 	int ret;
+ 
+ 	ret = i2c_smbus_read_word_data(client, TPS23881_REG_PW_STATUS);
+@@ -130,32 +309,35 @@ static int tps23881_pi_is_enabled(struct
+ 		return ret;
+ 
+ 	chan = priv->port[id].chan[0];
+-	if (chan < 4)
+-		enabled = ret & BIT(chan);
+-	else
+-		enabled = ret & BIT(chan + 4);
++	val = tps23881_calc_val(ret, chan, 0, BIT(chan % 4));
++	enabled = !!(val);
+ 
+ 	if (priv->port[id].is_4p) {
+ 		chan = priv->port[id].chan[1];
+-		if (chan < 4)
+-			enabled &= !!(ret & BIT(chan));
+-		else
+-			enabled &= !!(ret & BIT(chan + 4));
++		val = tps23881_calc_val(ret, chan, 0, BIT(chan % 4));
++		enabled &= !!(val);
+ 	}
+ 
+ 	/* Return enabled status only if both channel are on this state */
+-	return enabled;
++	if (enabled)
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
++	else
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++
++	return 0;
+ }
+ 
+-static int tps23881_ethtool_get_status(struct pse_controller_dev *pcdev,
+-				       unsigned long id,
+-				       struct netlink_ext_ack *extack,
+-				       struct pse_control_status *status)
++static int
++tps23881_pi_get_pw_status(struct pse_controller_dev *pcdev, int id,
++			  struct pse_pw_status *pw_status)
+ {
+ 	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
+ 	struct i2c_client *client = priv->client;
+-	bool enabled, delivering;
++	bool delivering;
+ 	u8 chan;
++	u16 val;
+ 	int ret;
+ 
+ 	ret = i2c_smbus_read_word_data(client, TPS23881_REG_PW_STATUS);
+@@ -163,40 +345,197 @@ static int tps23881_ethtool_get_status(s
+ 		return ret;
+ 
+ 	chan = priv->port[id].chan[0];
+-	if (chan < 4) {
+-		enabled = ret & BIT(chan);
+-		delivering = ret & BIT(chan + 4);
+-	} else {
+-		enabled = ret & BIT(chan + 4);
+-		delivering = ret & BIT(chan + 8);
+-	}
++	val = tps23881_calc_val(ret, chan, 4, BIT(chan % 4));
++	delivering = !!(val);
+ 
+ 	if (priv->port[id].is_4p) {
+ 		chan = priv->port[id].chan[1];
+-		if (chan < 4) {
+-			enabled &= !!(ret & BIT(chan));
+-			delivering &= !!(ret & BIT(chan + 4));
+-		} else {
+-			enabled &= !!(ret & BIT(chan + 4));
+-			delivering &= !!(ret & BIT(chan + 8));
+-		}
++		val = tps23881_calc_val(ret, chan, 4, BIT(chan % 4));
++		delivering &= !!(val);
+ 	}
+ 
+ 	/* Return delivering status only if both channel are on this state */
+ 	if (delivering)
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
+-	else
+-		status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
+-
+-	/* Return enabled status only if both channel are on this state */
+-	if (enabled)
+-		status->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
+ 	else
+-		status->c33_admin_state = ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
+ 
+ 	return 0;
+ }
+ 
++static int tps23881_pi_get_voltage(struct pse_controller_dev *pcdev, int id)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	struct i2c_client *client = priv->client;
++	int ret;
++	u64 uV;
++
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_INPUT_V);
++	if (ret < 0)
++		return ret;
++
++	uV = ret & 0x3fff;
++	uV *= TPS23881_UV_STEP;
++
++	return (int)uV;
++}
++
++static int
++tps23881_pi_get_chan_current(struct tps23881_priv *priv, u8 chan)
++{
++	struct i2c_client *client = priv->client;
++	int reg, ret;
++	u64 tmp_64;
++
++	/* Registers 0x30 to 0x3d */
++	reg = TPS23881_REG_CHAN1_A + (chan % 4) * 4 + (chan >= 4);
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	tmp_64 = ret & 0x3fff;
++	tmp_64 *= TPS23881_NA_STEP;
++	/* uA = nA / 1000 */
++	tmp_64 = DIV_ROUND_CLOSEST_ULL(tmp_64, 1000);
++	return (int)tmp_64;
++}
++
++static int tps23881_pi_get_pw_class(struct pse_controller_dev *pcdev,
++				    int id)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	struct i2c_client *client = priv->client;
++	int ret, reg;
++	u8 chan;
++
++	chan = priv->port[id].chan[0];
++	reg = TPS23881_REG_CHAN1_CLASS + (chan % 4);
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	return tps23881_calc_val(ret, chan, 4, 0x0f);
++}
++
++static int
++tps23881_pi_get_actual_pw(struct pse_controller_dev *pcdev, int id)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	int ret, uV, uA;
++	u64 tmp_64;
++	u8 chan;
++
++	ret = tps23881_pi_get_voltage(&priv->pcdev, id);
++	if (ret < 0)
++		return ret;
++	uV = ret;
++
++	chan = priv->port[id].chan[0];
++	ret = tps23881_pi_get_chan_current(priv, chan);
++	if (ret < 0)
++		return ret;
++	uA = ret;
++
++	if (priv->port[id].is_4p) {
++		chan = priv->port[id].chan[1];
++		ret = tps23881_pi_get_chan_current(priv, chan);
++		if (ret < 0)
++			return ret;
++		uA += ret;
++	}
++
++	tmp_64 = uV;
++	tmp_64 *= uA;
++	/* mW = uV * uA / 1000000000 */
++	return DIV_ROUND_CLOSEST_ULL(tmp_64, 1000000000);
++}
++
++static int
++tps23881_pi_get_pw_limit_chan(struct tps23881_priv *priv, u8 chan)
++{
++	struct i2c_client *client = priv->client;
++	int ret, reg;
++	u16 val;
++
++	reg = TPS23881_REG_2PAIR_POL1 + (chan % 4);
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	val = tps23881_calc_val(ret, chan, 0, 0xff);
++	return val * TPS23881_MW_STEP;
++}
++
++static int tps23881_pi_get_pw_limit(struct pse_controller_dev *pcdev, int id)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	int ret, mW;
++	u8 chan;
++
++	chan = priv->port[id].chan[0];
++	ret = tps23881_pi_get_pw_limit_chan(priv, chan);
++	if (ret < 0)
++		return ret;
++
++	mW = ret;
++	if (priv->port[id].is_4p) {
++		chan = priv->port[id].chan[1];
++		ret = tps23881_pi_get_pw_limit_chan(priv, chan);
++		if (ret < 0)
++			return ret;
++		mW += ret;
++	}
++
++	return mW;
++}
++
++static int tps23881_pi_set_pw_limit(struct pse_controller_dev *pcdev,
++				    int id, int max_mW)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	u8 pw_pol;
++	int ret;
++
++	if (max_mW < TPS23881_MIN_PI_PW_LIMIT_MW || MAX_PI_PW < max_mW) {
++		dev_err(&priv->client->dev,
++			"power limit %d out of ranges [%d,%d]",
++			max_mW, TPS23881_MIN_PI_PW_LIMIT_MW, MAX_PI_PW);
++		return -ERANGE;
++	}
++
++	ret = tps23881_pi_enable_manual_pol(priv, id);
++	if (ret < 0)
++		return ret;
++
++	pw_pol = DIV_ROUND_CLOSEST_ULL(max_mW, TPS23881_MW_STEP);
++
++	/* Save power policy to reconfigure it after a disabled call */
++	priv->port[id].pw_pol = pw_pol;
++	return tps23881_pi_set_pw_pol_limit(priv, id, pw_pol,
++					    priv->port[id].is_4p);
++}
++
++static int
++tps23881_pi_get_pw_limit_ranges(struct pse_controller_dev *pcdev, int id,
++				struct pse_pw_limit_ranges *pw_limit_ranges)
++{
++	struct ethtool_c33_pse_pw_limit_range *c33_pw_limit_ranges;
++
++	c33_pw_limit_ranges = kzalloc(sizeof(*c33_pw_limit_ranges),
++				      GFP_KERNEL);
++	if (!c33_pw_limit_ranges)
++		return -ENOMEM;
++
++	c33_pw_limit_ranges->min = TPS23881_MIN_PI_PW_LIMIT_MW;
++	c33_pw_limit_ranges->max = MAX_PI_PW;
++	pw_limit_ranges->c33_pw_limit_ranges = c33_pw_limit_ranges;
++
++	/* Return the number of ranges */
++	return 1;
++}
++
+ /* Parse managers subnode into a array of device node */
+ static int
+ tps23881_get_of_channels(struct tps23881_priv *priv,
+@@ -480,7 +819,7 @@ tps23881_write_port_matrix(struct tps238
+ 	struct i2c_client *client = priv->client;
+ 	u8 pi_id, lgcl_chan, hw_chan;
+ 	u16 val = 0;
+-	int i, ret;
++	int i;
+ 
+ 	for (i = 0; i < port_cnt; i++) {
+ 		pi_id = port_matrix[i].pi_id;
+@@ -488,8 +827,13 @@ tps23881_write_port_matrix(struct tps238
+ 		hw_chan = port_matrix[i].hw_chan[0] % 4;
+ 
+ 		/* Set software port matrix for existing ports */
+-		if (port_matrix[i].exist)
++		if (port_matrix[i].exist) {
+ 			priv->port[pi_id].chan[0] = lgcl_chan;
++			priv->port[pi_id].exist = true;
++		}
++
++		/* Initialize power policy internal value */
++		priv->port[pi_id].pw_pol = -1;
+ 
+ 		/* Set hardware port matrix for all ports */
+ 		val |= hw_chan << (lgcl_chan * 2);
+@@ -511,11 +855,7 @@ tps23881_write_port_matrix(struct tps238
+ 	}
+ 
+ 	/* Write hardware ports matrix */
+-	ret = i2c_smbus_write_word_data(client, TPS23881_REG_PORT_MAP, val);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	return i2c_smbus_write_word_data(client, TPS23881_REG_PORT_MAP, val);
+ }
+ 
+ static int
+@@ -564,11 +904,7 @@ tps23881_set_ports_conf(struct tps23881_
+ 			val |= BIT(port_matrix[i].lgcl_chan[1]) |
+ 			       BIT(port_matrix[i].lgcl_chan[1] + 4);
+ 	}
+-	ret = i2c_smbus_write_word_data(client, TPS23881_REG_DET_CLA_EN, val);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	return i2c_smbus_write_word_data(client, TPS23881_REG_DET_CLA_EN, val);
+ }
+ 
+ static int
+@@ -594,11 +930,7 @@ tps23881_set_ports_matrix(struct tps2388
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = tps23881_set_ports_conf(priv, port_matrix);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	return tps23881_set_ports_conf(priv, port_matrix);
+ }
+ 
+ static int tps23881_setup_pi_matrix(struct pse_controller_dev *pcdev)
+@@ -622,16 +954,84 @@ static int tps23881_setup_pi_matrix(stru
+ 	return ret;
+ }
+ 
++static int tps23881_power_class_table[] = {
++	-ERANGE,
++	4000,
++	7000,
++	15500,
++	30000,
++	15500,
++	15500,
++	-ERANGE,
++	45000,
++	60000,
++	75000,
++	90000,
++	15500,
++	45000,
++	-ERANGE,
++	-ERANGE,
++};
++
++static int tps23881_pi_get_pw_req(struct pse_controller_dev *pcdev, int id)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	struct i2c_client *client = priv->client;
++	u8 reg, chan;
++	int ret;
++	u16 val;
++
++	/* For a 4-pair the classification need 5ms to be completed */
++	if (priv->port[id].is_4p)
++		mdelay(5);
++
++	chan = priv->port[id].chan[0];
++	reg = TPS23881_REG_DISC + (chan % 4);
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	val = tps23881_calc_val(ret, chan, 4, 0xf);
++	return tps23881_power_class_table[val];
++}
++
+ static const struct pse_controller_ops tps23881_ops = {
+ 	.setup_pi_matrix = tps23881_setup_pi_matrix,
+ 	.pi_enable = tps23881_pi_enable,
+ 	.pi_disable = tps23881_pi_disable,
+-	.pi_is_enabled = tps23881_pi_is_enabled,
+-	.ethtool_get_status = tps23881_ethtool_get_status,
++	.pi_get_admin_state = tps23881_pi_get_admin_state,
++	.pi_get_pw_status = tps23881_pi_get_pw_status,
++	.pi_get_pw_class = tps23881_pi_get_pw_class,
++	.pi_get_actual_pw = tps23881_pi_get_actual_pw,
++	.pi_get_voltage = tps23881_pi_get_voltage,
++	.pi_get_pw_limit = tps23881_pi_get_pw_limit,
++	.pi_set_pw_limit = tps23881_pi_set_pw_limit,
++	.pi_get_pw_limit_ranges = tps23881_pi_get_pw_limit_ranges,
++	.pi_get_pw_req = tps23881_pi_get_pw_req,
++};
++
++struct tps23881_info {
++	u8 dev_id;	/* device ID and silicon revision */
++	const char *fw_parity_name;	/* parity code firmware file name */
++	const char *fw_sram_name;	/* SRAM code firmware file name */
+ };
+ 
+-static const char fw_parity_name[] = "ti/tps23881/tps23881-parity-14.bin";
+-static const char fw_sram_name[] = "ti/tps23881/tps23881-sram-14.bin";
++enum tps23881_model {
++	TPS23881,
++	TPS23881B,
++};
++
++static const struct tps23881_info tps23881_info[] = {
++	[TPS23881] = {
++		.dev_id = 0x22,
++		.fw_parity_name = "ti/tps23881/tps23881-parity-14.bin",
++		.fw_sram_name = "ti/tps23881/tps23881-sram-14.bin",
++	},
++	[TPS23881B] = {
++		.dev_id = 0x24,
++		/* skip SRAM load, ROM provides Clause 145 hardware-level support */
++	},
++};
+ 
+ struct tps23881_fw_conf {
+ 	u8 reg;
+@@ -703,16 +1103,17 @@ out:
+ 	return ret;
+ }
+ 
+-static int tps23881_flash_sram_fw(struct i2c_client *client)
++static int tps23881_flash_sram_fw(struct i2c_client *client,
++				  const struct tps23881_info *info)
+ {
+ 	int ret;
+ 
+-	ret = tps23881_flash_sram_fw_part(client, fw_parity_name,
++	ret = tps23881_flash_sram_fw_part(client, info->fw_parity_name,
+ 					  tps23881_fw_parity_conf);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = tps23881_flash_sram_fw_part(client, fw_sram_name,
++	ret = tps23881_flash_sram_fw_part(client, info->fw_sram_name,
+ 					  tps23881_fw_sram_conf);
+ 	if (ret)
+ 		return ret;
+@@ -726,9 +1127,311 @@ static int tps23881_flash_sram_fw(struct
+ 	return 0;
+ }
+ 
++/* Convert interrupt events to 0xff to be aligned with the chan
++ * number.
++ */
++static u8 tps23881_irq_export_chans_helper(u16 reg_val, u8 field_offset)
++{
++	u8 val;
++
++	val = (reg_val >> (4 + field_offset) & 0xf0) |
++	      (reg_val >> field_offset & 0x0f);
++
++	return val;
++}
++
++/* Convert chan number to port number */
++static void tps23881_set_notifs_helper(struct tps23881_priv *priv,
++				       u8 chans,
++				       unsigned long *notifs,
++				       unsigned long *notifs_mask,
++				       enum ethtool_pse_event event)
++{
++	u8 chan;
++	int i;
++
++	if (!chans)
++		return;
++
++	for (i = 0; i < TPS23881_MAX_CHANS; i++) {
++		if (!priv->port[i].exist)
++			continue;
++		/* No need to look at the 2nd channel in case of PoE4 as
++		 * both registers are set.
++		 */
++		chan = priv->port[i].chan[0];
++
++		if (BIT(chan) & chans) {
++			*notifs_mask |= BIT(i);
++			notifs[i] |= event;
++		}
++	}
++}
++
++static void tps23881_irq_event_over_temp(struct tps23881_priv *priv,
++					 u16 reg_val,
++					 unsigned long *notifs,
++					 unsigned long *notifs_mask)
++{
++	int i;
++
++	if (reg_val & TPS23881_REG_TSD) {
++		for (i = 0; i < TPS23881_MAX_CHANS; i++) {
++			if (!priv->port[i].exist)
++				continue;
++
++			*notifs_mask |= BIT(i);
++			notifs[i] |= ETHTOOL_PSE_EVENT_OVER_TEMP;
++		}
++	}
++}
++
++static int tps23881_irq_event_over_current(struct tps23881_priv *priv,
++					   u16 reg_val,
++					   unsigned long *notifs,
++					   unsigned long *notifs_mask)
++{
++	int i, ret;
++	u8 chans;
++
++	chans = tps23881_irq_export_chans_helper(reg_val, 0);
++	if (!chans)
++		return 0;
++
++	tps23881_set_notifs_helper(priv, chans, notifs, notifs_mask,
++				   ETHTOOL_PSE_EVENT_OVER_CURRENT |
++				   ETHTOOL_C33_PSE_EVENT_DISCONNECTION);
++
++	/* Over Current event resets the power limit registers so we need
++	 * to configured it again.
++	 */
++	for_each_set_bit(i, notifs_mask, priv->pcdev.nr_lines) {
++		if (priv->port[i].pw_pol < 0)
++			continue;
++
++		ret = tps23881_pi_enable_manual_pol(priv, i);
++		if (ret < 0)
++			return ret;
++
++		/* Set power policy */
++		ret = tps23881_pi_set_pw_pol_limit(priv, i,
++						   priv->port[i].pw_pol,
++						   priv->port[i].is_4p);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
++static void tps23881_irq_event_disconnection(struct tps23881_priv *priv,
++					     u16 reg_val,
++					     unsigned long *notifs,
++					     unsigned long *notifs_mask)
++{
++	u8 chans;
++
++	chans = tps23881_irq_export_chans_helper(reg_val, 4);
++	if (chans)
++		tps23881_set_notifs_helper(priv, chans, notifs, notifs_mask,
++					   ETHTOOL_C33_PSE_EVENT_DISCONNECTION);
++}
++
++static int tps23881_irq_event_detection(struct tps23881_priv *priv,
++					u16 reg_val,
++					unsigned long *notifs,
++					unsigned long *notifs_mask)
++{
++	enum ethtool_pse_event event;
++	int reg, ret, i, val;
++	unsigned long chans;
++
++	chans = tps23881_irq_export_chans_helper(reg_val, 0);
++	for_each_set_bit(i, &chans, TPS23881_MAX_CHANS) {
++		reg = TPS23881_REG_DISC + (i % 4);
++		ret = i2c_smbus_read_word_data(priv->client, reg);
++		if (ret < 0)
++			return ret;
++
++		val = tps23881_calc_val(ret, i, 0, 0xf);
++		/* If detection valid */
++		if (val == 0x4)
++			event = ETHTOOL_C33_PSE_EVENT_DETECTION;
++		else
++			event = ETHTOOL_C33_PSE_EVENT_DISCONNECTION;
++
++		tps23881_set_notifs_helper(priv, BIT(i), notifs,
++					   notifs_mask, event);
++	}
++
++	return 0;
++}
++
++static int tps23881_irq_event_classification(struct tps23881_priv *priv,
++					     u16 reg_val,
++					     unsigned long *notifs,
++					     unsigned long *notifs_mask)
++{
++	int reg, ret, val, i;
++	unsigned long chans;
++
++	chans = tps23881_irq_export_chans_helper(reg_val, 4);
++	for_each_set_bit(i, &chans, TPS23881_MAX_CHANS) {
++		reg = TPS23881_REG_DISC + (i % 4);
++		ret = i2c_smbus_read_word_data(priv->client, reg);
++		if (ret < 0)
++			return ret;
++
++		val = tps23881_calc_val(ret, i, 4, 0xf);
++		/* Do not report classification event for unknown class */
++		if (!val || val == 0x8 || val == 0xf)
++			continue;
++
++		tps23881_set_notifs_helper(priv, BIT(i), notifs,
++					   notifs_mask,
++					   ETHTOOL_C33_PSE_EVENT_CLASSIFICATION);
++	}
++
++	return 0;
++}
++
++static int tps23881_irq_event_handler(struct tps23881_priv *priv, u16 reg,
++				      unsigned long *notifs,
++				      unsigned long *notifs_mask)
++{
++	struct i2c_client *client = priv->client;
++	int ret, val;
++
++	/* The Supply event bit is repeated twice so we only need to read
++	 * the one from the first byte.
++	 */
++	if (reg & TPS23881_REG_IT_SUPF) {
++		ret = i2c_smbus_read_word_data(client, TPS23881_REG_SUPF_EVENT);
++		if (ret < 0)
++			return ret;
++		tps23881_irq_event_over_temp(priv, ret, notifs, notifs_mask);
++	}
++
++	if (reg & (TPS23881_REG_IT_IFAULT | TPS23881_REG_IT_IFAULT << 8 |
++		   TPS23881_REG_IT_DISF | TPS23881_REG_IT_DISF << 8)) {
++		ret = i2c_smbus_read_word_data(client, TPS23881_REG_FAULT);
++		if (ret < 0)
++			return ret;
++		ret = tps23881_irq_event_over_current(priv, ret, notifs,
++						      notifs_mask);
++		if (ret)
++			return ret;
++
++		tps23881_irq_event_disconnection(priv, ret, notifs, notifs_mask);
++	}
++
++	if (reg & (TPS23881_REG_IT_DETC | TPS23881_REG_IT_DETC << 8 |
++		   TPS23881_REG_IT_CLASC | TPS23881_REG_IT_CLASC << 8)) {
++		ret = i2c_smbus_read_word_data(client, TPS23881_REG_DET_EVENT);
++		if (ret < 0)
++			return ret;
++
++		val = ret;
++		ret = tps23881_irq_event_detection(priv, val, notifs,
++						   notifs_mask);
++		if (ret)
++			return ret;
++
++		ret = tps23881_irq_event_classification(priv, val, notifs,
++							notifs_mask);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int tps23881_irq_handler(int irq, struct pse_controller_dev *pcdev,
++				unsigned long *notifs,
++				unsigned long *notifs_mask)
++{
++	struct tps23881_priv *priv = to_tps23881_priv(pcdev);
++	struct i2c_client *client = priv->client;
++	int ret, it_mask, retry;
++
++	/* Get interruption mask */
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_IT_MASK);
++	if (ret < 0)
++		return ret;
++	it_mask = ret;
++
++	/* Read interrupt register until it frees the interruption pin. */
++	retry = 0;
++	while (true) {
++		if (retry > TPS23881_MAX_IRQ_RETRIES) {
++			dev_err(&client->dev, "interrupt never freed");
++			return -ETIMEDOUT;
++		}
++
++		ret = i2c_smbus_read_word_data(client, TPS23881_REG_IT);
++		if (ret < 0)
++			return ret;
++
++		/* No more relevant interruption */
++		if (!(ret & it_mask))
++			return 0;
++
++		ret = tps23881_irq_event_handler(priv, (u16)ret, notifs,
++						 notifs_mask);
++		if (ret)
++			return ret;
++
++		retry++;
++	}
++	return 0;
++}
++
++static int tps23881_setup_irq(struct tps23881_priv *priv, int irq)
++{
++	struct i2c_client *client = priv->client;
++	struct pse_irq_desc irq_desc = {
++		.name = "tps23881-irq",
++		.map_event = tps23881_irq_handler,
++	};
++	int ret;
++	u16 val;
++
++	if (!irq) {
++		dev_err(&client->dev, "interrupt is missing");
++		return -EINVAL;
++	}
++
++	val = TPS23881_REG_IT_IFAULT | TPS23881_REG_IT_SUPF |
++	      TPS23881_REG_IT_DETC | TPS23881_REG_IT_CLASC |
++	      TPS23881_REG_IT_DISF;
++	val |= val << 8;
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_IT_MASK, val);
++	if (ret)
++		return ret;
++
++	ret = i2c_smbus_read_word_data(client, TPS23881_REG_GEN_MASK);
++	if (ret < 0)
++		return ret;
++
++	val = TPS23881_REG_INTEN | TPS23881_REG_CLCHE | TPS23881_REG_DECHE;
++	val |= val << 8;
++	val |= (u16)ret;
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_GEN_MASK, val);
++	if (ret < 0)
++		return ret;
++
++	/* Reset interrupts registers */
++	ret = i2c_smbus_write_word_data(client, TPS23881_REG_RESET,
++					TPS23881_REG_CLRAIN);
++	if (ret < 0)
++		return ret;
++
++	return devm_pse_irq_helper(&priv->pcdev, irq, 0, &irq_desc);
++}
++
+ static int tps23881_i2c_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
++	const struct tps23881_info *info;
+ 	struct tps23881_priv *priv;
+ 	struct gpio_desc *reset;
+ 	int ret;
+@@ -739,6 +1442,10 @@ static int tps23881_i2c_probe(struct i2c
+ 		return -ENXIO;
+ 	}
+ 
++	info = i2c_get_match_data(client);
++	if (!info)
++		return -EINVAL;
++
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+ 		return -ENOMEM;
+@@ -757,7 +1464,7 @@ static int tps23881_i2c_probe(struct i2c
+ 		 * to Load TPS2388x SRAM and Parity Code over I2C" (Rev E))
+ 		 * indicates we should delay that programming by at least 50ms. So
+ 		 * we'll wait the entire 50ms here to ensure we're safe to go to the
+-		 * SRAM loading proceedure.
++		 * SRAM loading procedure.
+ 		 */
+ 		msleep(50);
+ 	}
+@@ -766,20 +1473,27 @@ static int tps23881_i2c_probe(struct i2c
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (FIELD_GET(TPS23881_REG_DEVID_MASK, ret) != TPS23881_DEVICE_ID) {
++	if (ret != info->dev_id) {
+ 		dev_err(dev, "Wrong device ID\n");
+ 		return -ENXIO;
+ 	}
+ 
+-	ret = tps23881_flash_sram_fw(client);
+-	if (ret < 0)
+-		return ret;
++	if (info->fw_sram_name) {
++		ret = tps23881_flash_sram_fw(client, info);
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	ret = i2c_smbus_read_byte_data(client, TPS23881_REG_FWREV);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	dev_info(&client->dev, "Firmware revision 0x%x\n", ret);
++	if (ret == 0xFF) {
++		dev_err(&client->dev, "Device entered safe mode\n");
++		return -ENXIO;
++	}
++	dev_info(&client->dev, "Firmware revision 0x%x%s\n", ret,
++		 ret == 0x00 ? " (ROM firmware)" : "");
+ 
+ 	/* Set configuration B, 16 bit access on a single device address */
+ 	ret = i2c_smbus_read_byte_data(client, TPS23881_REG_GEN_MASK);
+@@ -800,23 +1514,36 @@ static int tps23881_i2c_probe(struct i2c
+ 	priv->pcdev.dev = dev;
+ 	priv->pcdev.types = ETHTOOL_PSE_C33;
+ 	priv->pcdev.nr_lines = TPS23881_MAX_CHANS;
++	priv->pcdev.supp_budget_eval_strategies = PSE_BUDGET_EVAL_STRAT_STATIC;
+ 	ret = devm_pse_controller_register(dev, &priv->pcdev);
+ 	if (ret) {
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to register PSE controller\n");
+ 	}
+ 
++	ret = tps23881_setup_irq(priv, client->irq);
++	if (ret)
++		return ret;
++
+ 	return ret;
+ }
+ 
+ static const struct i2c_device_id tps23881_id[] = {
+-	{ "tps23881" },
++	{ "tps23881", .driver_data = (kernel_ulong_t)&tps23881_info[TPS23881] },
++	{ "tps23881b", .driver_data = (kernel_ulong_t)&tps23881_info[TPS23881B] },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(i2c, tps23881_id);
+ 
+ static const struct of_device_id tps23881_of_match[] = {
+-	{ .compatible = "ti,tps23881", },
++	{
++		.compatible = "ti,tps23881",
++		.data = &tps23881_info[TPS23881]
++	},
++	{
++		.compatible = "ti,tps23881b",
++		.data = &tps23881_info[TPS23881B]
++	},
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, tps23881_of_match);
+--- a/include/linux/ethtool_netlink.h
++++ b/include/linux/ethtool_netlink.h
+@@ -122,6 +122,15 @@ static inline bool ethtool_dev_mm_suppor
+ 
+ #endif /* IS_ENABLED(CONFIG_ETHTOOL_NETLINK) */
+ 
++/* PSE notification stub - backported from 6.19
++ * In 6.19 this sends netlink notifications for PSE events.
++ * For 6.12 backport, this is a no-op stub.
++ */
++static inline void ethnl_pse_send_ntf(struct net_device *dev,
++				      unsigned long notifs)
++{
++}
++
+ static inline int ethnl_cable_test_result(struct phy_device *phydev, u8 pair,
+ 					  u8 result)
+ {
+--- a/include/linux/pse-pd/pse.h
++++ b/include/linux/pse-pd/pse.h
+@@ -5,15 +5,34 @@
+ #ifndef _LINUX_PSE_CONTROLLER_H
+ #define _LINUX_PSE_CONTROLLER_H
+ 
+-#include <linux/ethtool.h>
+ #include <linux/list.h>
+-#include <uapi/linux/ethtool.h>
++#include <linux/netlink.h>
++#include <linux/kfifo.h>
++#include <linux/ethtool.h>
++#include <linux/regulator/driver.h>
+ 
+ /* Maximum current in uA according to IEEE 802.3-2022 Table 145-1 */
+ #define MAX_PI_CURRENT 1920000
++/* Maximum power in mW according to IEEE 802.3-2022 Table 145-16 */
++#define MAX_PI_PW 99900
+ 
++struct net_device;
+ struct phy_device;
+ struct pse_controller_dev;
++struct netlink_ext_ack;
++
++/**
++ * struct pse_irq_desc - notification sender description for IRQ based events.
++ *
++ * @name: the visible name for the IRQ
++ * @map_event: driver callback to map IRQ status into PSE devices with events.
++ */
++struct pse_irq_desc {
++	const char *name;
++	int (*map_event)(int irq, struct pse_controller_dev *pcdev,
++			 unsigned long *notifs,
++			 unsigned long *notifs_mask);
++};
+ 
+ /**
+  * struct pse_control_config - PSE control/channel configuration.
+@@ -29,10 +48,56 @@ struct pse_control_config {
+ };
+ 
+ /**
+- * struct pse_control_status - PSE control/channel status.
++ * struct pse_admin_state - PSE operational state
+  *
+  * @podl_admin_state: operational state of the PoDL PSE
+  *	functions. IEEE 802.3-2018 30.15.1.1.2 aPoDLPSEAdminState
++ * @c33_admin_state: operational state of the PSE
++ *	functions. IEEE 802.3-2022 30.9.1.1.2 aPSEAdminState
++ */
++struct pse_admin_state {
++	enum ethtool_podl_pse_admin_state podl_admin_state;
++	enum ethtool_c33_pse_admin_state c33_admin_state;
++};
++
++/**
++ * struct pse_pw_status - PSE power detection status
++ *
++ * @podl_pw_status: power detection status of the PoDL PSE.
++ *	IEEE 802.3-2018 30.15.1.1.3 aPoDLPSEPowerDetectionStatus:
++ * @c33_pw_status: power detection status of the PSE.
++ *	IEEE 802.3-2022 30.9.1.1.5 aPSEPowerDetectionStatus:
++ */
++struct pse_pw_status {
++	enum ethtool_podl_pse_pw_d_status podl_pw_status;
++	enum ethtool_c33_pse_pw_d_status c33_pw_status;
++};
++
++/**
++ * struct pse_ext_state_info - PSE extended state information
++ *
++ * @c33_ext_state_info: extended state information of the PSE
++ */
++struct pse_ext_state_info {
++	struct ethtool_c33_pse_ext_state_info c33_ext_state_info;
++};
++
++/**
++ * struct pse_pw_limit_ranges - PSE power limit configuration range
++ *
++ * @c33_pw_limit_ranges: supported power limit configuration range. The driver
++ *			 is in charge of the memory allocation.
++ */
++struct pse_pw_limit_ranges {
++	struct ethtool_c33_pse_pw_limit_range *c33_pw_limit_ranges;
++};
++
++/**
++ * struct ethtool_pse_control_status - PSE control/channel status.
++ *
++ * @pw_d_id: PSE power domain index.
++ * @podl_admin_state: operational state of the PoDL PSE
++ *	functions. IEEE 802.3-2018 30.15.1.1.2 aPoDLPSEAdminState
+  * @podl_pw_status: power detection status of the PoDL PSE.
+  *	IEEE 802.3-2018 30.15.1.1.3 aPoDLPSEPowerDetectionStatus:
+  * @c33_admin_state: operational state of the PSE
+@@ -47,11 +112,15 @@ struct pse_control_config {
+  * @c33_avail_pw_limit: available power limit of the PSE in mW
+  *	IEEE 802.3-2022 145.2.5.4 pse_avail_pwr
+  * @c33_pw_limit_ranges: supported power limit configuration range. The driver
+- *	is in charge of the memory allocation.
++ *	is in charge of the memory allocation
+  * @c33_pw_limit_nb_ranges: number of supported power limit configuration
+  *	ranges
++ * @prio_max: max priority allowed for the c33_prio variable value.
++ * @prio: priority of the PSE. Managed by PSE core in case of static budget
++ *	evaluation strategy.
+  */
+-struct pse_control_status {
++struct ethtool_pse_control_status {
++	u32 pw_d_id;
+ 	enum ethtool_podl_pse_admin_state podl_admin_state;
+ 	enum ethtool_podl_pse_pw_d_status podl_pw_status;
+ 	enum ethtool_c33_pse_admin_state c33_admin_state;
+@@ -62,28 +131,53 @@ struct pse_control_status {
+ 	u32 c33_avail_pw_limit;
+ 	struct ethtool_c33_pse_pw_limit_range *c33_pw_limit_ranges;
+ 	u32 c33_pw_limit_nb_ranges;
++	u32 prio_max;
++	u32 prio;
+ };
+ 
+ /**
+  * struct pse_controller_ops - PSE controller driver callbacks
+  *
+- * @ethtool_get_status: get PSE control status for ethtool interface
+- * @setup_pi_matrix: setup PI matrix of the PSE controller
+- * @pi_is_enabled: Return 1 if the PSE PI is enabled, 0 if not.
+- *		   May also return negative errno.
++ * @setup_pi_matrix: Setup PI matrix of the PSE controller.
++ *		     The PSE PIs devicetree nodes have already been parsed by
++ *		     of_load_pse_pis() and the pcdev->pi[x]->pairset[y].np
++ *		     populated. This callback should establish the
++ *		     relationship between the PSE controller hardware ports
++ *		     and the PSE Power Interfaces, either through software
++ *		     mapping or hardware configuration.
++ * @pi_get_admin_state: Get the operational state of the PSE PI. This ops
++ *			is mandatory.
++ * @pi_get_pw_status: Get the power detection status of the PSE PI. This
++ *		      ops is mandatory.
++ * @pi_get_ext_state: Get the extended state of the PSE PI.
++ * @pi_get_pw_class: Get the power class of the PSE PI.
++ * @pi_get_actual_pw: Get actual power of the PSE PI in mW.
+  * @pi_enable: Configure the PSE PI as enabled.
+  * @pi_disable: Configure the PSE PI as disabled.
+  * @pi_get_voltage: Return voltage similarly to get_voltage regulator
+- *		    callback.
+- * @pi_get_pw_limit: Get the configured power limit of the PSE PI.
+- * @pi_set_pw_limit: Configure the power limit of the PSE PI.
++ *		    callback in uV.
++ * @pi_get_pw_limit: Get the configured power limit of the PSE PI in mW.
++ * @pi_set_pw_limit: Configure the power limit of the PSE PI in mW.
++ * @pi_get_pw_limit_ranges: Get the supported power limit configuration
++ *			    range. The driver is in charge of the memory
++ *			    allocation and should return the number of
++ *			    ranges.
++ * @pi_get_prio: Get the PSE PI priority.
++ * @pi_set_prio: Configure the PSE PI priority.
++ * @pi_get_pw_req: Get the power requested by a PD before enabling the PSE PI.
++ *		   This is only relevant when an interrupt is registered using
++ *		   devm_pse_irq_helper helper.
+  */
+ struct pse_controller_ops {
+-	int (*ethtool_get_status)(struct pse_controller_dev *pcdev,
+-		unsigned long id, struct netlink_ext_ack *extack,
+-		struct pse_control_status *status);
+ 	int (*setup_pi_matrix)(struct pse_controller_dev *pcdev);
+-	int (*pi_is_enabled)(struct pse_controller_dev *pcdev, int id);
++	int (*pi_get_admin_state)(struct pse_controller_dev *pcdev, int id,
++				  struct pse_admin_state *admin_state);
++	int (*pi_get_pw_status)(struct pse_controller_dev *pcdev, int id,
++				struct pse_pw_status *pw_status);
++	int (*pi_get_ext_state)(struct pse_controller_dev *pcdev, int id,
++				struct pse_ext_state_info *ext_state_info);
++	int (*pi_get_pw_class)(struct pse_controller_dev *pcdev, int id);
++	int (*pi_get_actual_pw)(struct pse_controller_dev *pcdev, int id);
+ 	int (*pi_enable)(struct pse_controller_dev *pcdev, int id);
+ 	int (*pi_disable)(struct pse_controller_dev *pcdev, int id);
+ 	int (*pi_get_voltage)(struct pse_controller_dev *pcdev, int id);
+@@ -91,12 +185,19 @@ struct pse_controller_ops {
+ 			       int id);
+ 	int (*pi_set_pw_limit)(struct pse_controller_dev *pcdev,
+ 			       int id, int max_mW);
++	int (*pi_get_pw_limit_ranges)(struct pse_controller_dev *pcdev, int id,
++				      struct pse_pw_limit_ranges *pw_limit_ranges);
++	int (*pi_get_prio)(struct pse_controller_dev *pcdev, int id);
++	int (*pi_set_prio)(struct pse_controller_dev *pcdev, int id,
++			   unsigned int prio);
++	int (*pi_get_pw_req)(struct pse_controller_dev *pcdev, int id);
+ };
+ 
+ struct module;
+ struct device_node;
+ struct of_phandle_args;
+ struct pse_control;
++struct ethtool_pse_control_status;
+ 
+ /* PSE PI pairset pinout can either be Alternative A or Alternative B */
+ enum pse_pi_pairset_pinout {
+@@ -124,12 +225,35 @@ struct pse_pi_pairset {
+  * @np: device node pointer of the PSE PI node
+  * @rdev: regulator represented by the PSE PI
+  * @admin_state_enabled: PI enabled state
++ * @pw_d: Power domain of the PSE PI
++ * @prio: Priority of the PSE PI. Used in static budget evaluation strategy
++ * @isr_pd_detected: PSE PI detection status managed by the interruption
++ *		     handler. This variable is relevant when the power enabled
++ *		     management is managed in software like the static
++ *		     budget evaluation strategy.
++ * @pw_allocated_mW: Power allocated to a PSE PI to manage power budget in
++ *		     static budget evaluation strategy.
+  */
+ struct pse_pi {
+ 	struct pse_pi_pairset pairset[2];
+ 	struct device_node *np;
+ 	struct regulator_dev *rdev;
+ 	bool admin_state_enabled;
++	struct pse_power_domain *pw_d;
++	int prio;
++	bool isr_pd_detected;
++	int pw_allocated_mW;
++};
++
++/**
++ * struct pse_ntf - PSE notification element
++ *
++ * @id: ID of the PSE control
++ * @notifs: PSE notifications to be reported
++ */
++struct pse_ntf {
++	int id;
++	unsigned long notifs;
+ };
+ 
+ /**
+@@ -146,6 +270,13 @@ struct pse_pi {
+  * @types: types of the PSE controller
+  * @pi: table of PSE PIs described in this controller device
+  * @no_of_pse_pi: flag set if the pse_pis devicetree node is not used
++ * @irq: PSE interrupt
++ * @pis_prio_max: Maximum value allowed for the PSE PIs priority
++ * @supp_budget_eval_strategies: budget evaluation strategies supported
++ *				 by the PSE
++ * @ntf_work: workqueue for PSE notification management
++ * @ntf_fifo: PSE notifications FIFO
++ * @ntf_fifo_lock: protect @ntf_fifo writer
+  */
+ struct pse_controller_dev {
+ 	const struct pse_controller_ops *ops;
+@@ -159,6 +290,30 @@ struct pse_controller_dev {
+ 	enum ethtool_pse_types types;
+ 	struct pse_pi *pi;
+ 	bool no_of_pse_pi;
++	int irq;
++	unsigned int pis_prio_max;
++	u32 supp_budget_eval_strategies;
++	struct work_struct ntf_work;
++	DECLARE_KFIFO_PTR(ntf_fifo, struct pse_ntf);
++	spinlock_t ntf_fifo_lock; /* Protect @ntf_fifo writer */
++};
++
++/**
++ * enum pse_budget_eval_strategies - PSE budget evaluation strategies.
++ * @PSE_BUDGET_EVAL_STRAT_DISABLED: Budget evaluation strategy disabled.
++ * @PSE_BUDGET_EVAL_STRAT_STATIC: PSE static budget evaluation strategy.
++ *	Budget evaluation strategy based on the power requested during PD
++ *	classification. This strategy is managed by the PSE core.
++ * @PSE_BUDGET_EVAL_STRAT_DYNAMIC: PSE dynamic budget evaluation
++ *	strategy. Budget evaluation strategy based on the current consumption
++ *	per ports compared to the total	power budget. This mode is managed by
++ *	the PSE controller.
++ */
++
++enum pse_budget_eval_strategies {
++	PSE_BUDGET_EVAL_STRAT_DISABLED	= 1 << 0,
++	PSE_BUDGET_EVAL_STRAT_STATIC	= 1 << 1,
++	PSE_BUDGET_EVAL_STRAT_DYNAMIC	= 1 << 2,
+ };
+ 
+ #if IS_ENABLED(CONFIG_PSE_CONTROLLER)
+@@ -167,28 +322,33 @@ void pse_controller_unregister(struct ps
+ struct device;
+ int devm_pse_controller_register(struct device *dev,
+ 				 struct pse_controller_dev *pcdev);
++int devm_pse_irq_helper(struct pse_controller_dev *pcdev, int irq,
++			int irq_flags, const struct pse_irq_desc *d);
+ 
+-struct pse_control *of_pse_control_get(struct device_node *node);
++struct pse_control *of_pse_control_get(struct device_node *node,
++				       struct phy_device *phydev);
+ void pse_control_put(struct pse_control *psec);
+ 
+ int pse_ethtool_get_status(struct pse_control *psec,
+ 			   struct netlink_ext_ack *extack,
+-			   struct pse_control_status *status);
++			   struct ethtool_pse_control_status *status);
+ int pse_ethtool_set_config(struct pse_control *psec,
+ 			   struct netlink_ext_ack *extack,
+ 			   const struct pse_control_config *config);
+ int pse_ethtool_set_pw_limit(struct pse_control *psec,
+ 			     struct netlink_ext_ack *extack,
+ 			     const unsigned int pw_limit);
+-int pse_ethtool_get_pw_limit(struct pse_control *psec,
+-			     struct netlink_ext_ack *extack);
++int pse_ethtool_set_prio(struct pse_control *psec,
++			 struct netlink_ext_ack *extack,
++			 unsigned int prio);
+ 
+ bool pse_has_podl(struct pse_control *psec);
+ bool pse_has_c33(struct pse_control *psec);
+ 
+ #else
+ 
+-static inline struct pse_control *of_pse_control_get(struct device_node *node)
++static inline struct pse_control *of_pse_control_get(struct device_node *node,
++						     struct phy_device *phydev)
+ {
+ 	return ERR_PTR(-ENOENT);
+ }
+@@ -199,7 +359,7 @@ static inline void pse_control_put(struc
+ 
+ static inline int pse_ethtool_get_status(struct pse_control *psec,
+ 					 struct netlink_ext_ack *extack,
+-					 struct pse_control_status *status)
++					 struct ethtool_pse_control_status *status)
+ {
+ 	return -EOPNOTSUPP;
+ }
+@@ -218,8 +378,9 @@ static inline int pse_ethtool_set_pw_lim
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline int pse_ethtool_get_pw_limit(struct pse_control *psec,
+-					   struct netlink_ext_ack *extack)
++static inline int pse_ethtool_set_prio(struct pse_control *psec,
++				       struct netlink_ext_ack *extack,
++				       unsigned int prio)
+ {
+ 	return -EOPNOTSUPP;
+ }
+--- a/include/linux/regulator/consumer.h
++++ b/include/linux/regulator/consumer.h
+@@ -282,6 +282,18 @@ void regulator_bulk_set_supply_names(str
+ 
+ bool regulator_is_equal(struct regulator *reg1, struct regulator *reg2);
+ 
++/* power budget management - backported stubs for 6.12 */
++static inline int regulator_request_power_budget(struct regulator *regulator,
++						 unsigned int mW)
++{
++	return 0;
++}
++
++static inline void regulator_free_power_budget(struct regulator *regulator,
++					       unsigned int mW)
++{
++}
++
+ #else
+ 
+ /*
+@@ -661,6 +673,18 @@ regulator_is_equal(struct regulator *reg
+ {
+ 	return false;
+ }
++
++/* power budget management - backported stubs for 6.12 */
++static inline int regulator_request_power_budget(struct regulator *regulator,
++						 unsigned int mW)
++{
++	return 0;
++}
++
++static inline void regulator_free_power_budget(struct regulator *regulator,
++					       unsigned int mW)
++{
++}
+ #endif
+ 
+ static inline int regulator_set_voltage_triplet(struct regulator *regulator,
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@ -1044,6 +1044,20 @@ enum ethtool_podl_pse_pw_d_status {
+ };
+ 
+ /**
++ * PSE events - Backported from 6.19 for PSE notification support
++ * These are bitmask values for PSE event notifications.
++ */
++#define ETHTOOL_PSE_EVENT_OVER_CURRENT		BIT(0)
++#define ETHTOOL_PSE_EVENT_OVER_TEMP		BIT(1)
++#define ETHTOOL_PSE_EVENT_OVER_BUDGET		BIT(2)
++#define ETHTOOL_PSE_EVENT_SW_PW_CONTROL_ERROR	BIT(3)
++
++/* C33 PSE events */
++#define ETHTOOL_C33_PSE_EVENT_DETECTION		BIT(16)
++#define ETHTOOL_C33_PSE_EVENT_CLASSIFICATION	BIT(17)
++#define ETHTOOL_C33_PSE_EVENT_DISCONNECTION	BIT(18)
++
++/**
+  * enum ethtool_mm_verify_status - status of MAC Merge Verify function
+  * @ETHTOOL_MM_VERIFY_STATUS_UNKNOWN:
+  *	verification status is unknown
+--- a/net/ethtool/pse-pd.c
++++ b/net/ethtool/pse-pd.c
+@@ -7,7 +7,7 @@
+ //
+ 
+ #include "common.h"
+-#include "linux/pse-pd/pse.h"
++#include <linux/pse-pd/pse.h>
+ #include "netlink.h"
+ #include <linux/ethtool_netlink.h>
+ #include <linux/ethtool.h>
+@@ -19,7 +19,7 @@ struct pse_req_info {
+ 
+ struct pse_reply_data {
+ 	struct ethnl_reply_data	base;
+-	struct pse_control_status status;
++	struct ethtool_pse_control_status status;
+ };
+ 
+ #define PSE_REPDATA(__reply_base) \
+@@ -80,7 +80,7 @@ static int pse_reply_size(const struct e
+ 			  const struct ethnl_reply_data *reply_base)
+ {
+ 	const struct pse_reply_data *data = PSE_REPDATA(reply_base);
+-	const struct pse_control_status *st = &data->status;
++	const struct ethtool_pse_control_status *st = &data->status;
+ 	int len = 0;
+ 
+ 	if (st->podl_admin_state > 0)
+@@ -114,7 +114,7 @@ static int pse_reply_size(const struct e
+ }
+ 
+ static int pse_put_pw_limit_ranges(struct sk_buff *skb,
+-				   const struct pse_control_status *st)
++				   const struct ethtool_pse_control_status *st)
+ {
+ 	const struct ethtool_c33_pse_pw_limit_range *pw_limit_ranges;
+ 	int i;
+@@ -146,7 +146,7 @@ static int pse_fill_reply(struct sk_buff
+ 			  const struct ethnl_reply_data *reply_base)
+ {
+ 	const struct pse_reply_data *data = PSE_REPDATA(reply_base);
+-	const struct pse_control_status *st = &data->status;
++	const struct ethtool_pse_control_status *st = &data->status;
+ 
+ 	if (st->podl_admin_state > 0 &&
+ 	    nla_put_u32(skb, ETHTOOL_A_PODL_PSE_ADMIN_STATE,
+--- a/drivers/net/mdio/fwnode_mdio.c
++++ b/drivers/net/mdio/fwnode_mdio.c
+@@ -18,7 +18,8 @@ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("FWNODE MDIO bus (Ethernet PHY) accessors");
+ 
+ static struct pse_control *
+-fwnode_find_pse_control(struct fwnode_handle *fwnode)
++fwnode_find_pse_control(struct fwnode_handle *fwnode,
++			struct phy_device *phydev)
+ {
+ 	struct pse_control *psec;
+ 	struct device_node *np;
+@@ -30,8 +31,8 @@ fwnode_find_pse_control(struct fwnode_ha
+ 	if (!np)
+ 		return NULL;
+ 
+-	psec = of_pse_control_get(np);
+-	if (PTR_ERR(psec) == -ENOENT)
++	psec = of_pse_control_get(np, phydev);
++	if (PTR_ERR(psec) == -ENOENT)
+ 		return NULL;
+ 
+ 	return psec;
+@@ -128,15 +129,9 @@ int fwnode_mdiobus_register_phy(struct m
+ 	u32 phy_id;
+ 	int rc;
+ 
+-	psec = fwnode_find_pse_control(child);
+-	if (IS_ERR(psec))
+-		return PTR_ERR(psec);
+-
+ 	mii_ts = fwnode_find_mii_timestamper(child);
+-	if (IS_ERR(mii_ts)) {
+-		rc = PTR_ERR(mii_ts);
+-		goto clean_pse;
+-	}
++	if (IS_ERR(mii_ts))
++		return PTR_ERR(mii_ts);
+ 
+ 	is_c45 = fwnode_device_is_compatible(child, "ethernet-phy-ieee802.3-c45");
+ 	if (is_c45 || fwnode_get_phy_id(child, &phy_id))
+@@ -169,6 +164,12 @@ int fwnode_mdiobus_register_phy(struct m
+ 			goto clean_phy;
+ 	}
+ 
++	psec = fwnode_find_pse_control(child, phy);
++	if (IS_ERR(psec)) {
++		rc = PTR_ERR(psec);
++		goto unregister_phy;
++	}
++
+ 	phy->psec = psec;
+ 
+ 	/* phy->mii_ts may already be defined by the PHY driver. A
+@@ -180,12 +181,13 @@ int fwnode_mdiobus_register_phy(struct m
+ 
+ 	return 0;
+ 
++unregister_phy:
++	if (is_acpi_node(child) || is_of_node(child))
++		phy_device_remove(phy);
+ clean_phy:
+ 	phy_device_free(phy);
+ clean_mii_ts:
+ 	unregister_mii_timestamper(mii_ts);
+-clean_pse:
+-	pse_control_put(psec);
+ 
+ 	return rc;
+ }
+ --- /dev/null
++++ b/drivers/net/pse-pd/si3474.c
+@@ -0,0 +1,578 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Driver for the Skyworks Si3474 PoE PSE Controller
++ *
++ * Chip Architecture & Terminology:
++ *
++ * The Si3474 is a single-chip PoE PSE controller managing 8 physical power
++ * delivery channels. Internally, it's structured into two logical "Quads".
++ *
++ * Quad 0: Manages physical channels ('ports' in datasheet) 0, 1, 2, 3
++ * Quad 1: Manages physical channels ('ports' in datasheet) 4, 5, 6, 7
++ *
++ * Each Quad is accessed via a separate I2C address. The base address range is
++ * set by hardware pins A1-A4, and the specific address selects Quad 0 (usually
++ * the lower/even address) or Quad 1 (usually the higher/odd address).
++ * See datasheet Table 2.2 for the address mapping.
++ *
++ * While the Quads manage channel-specific operations, the Si3474 package has
++ * several resources shared across the entire chip:
++ * - Single RESETb input pin.
++ * - Single INTb output pin (signals interrupts from *either* Quad).
++ * - Single OSS input pin (Emergency Shutdown).
++ * - Global I2C Address (0x7F) used for firmware updates.
++ * - Global status monitoring (Temperature, VDD/VPWR Undervoltage Lockout).
++ *
++ * Driver Architecture:
++ *
++ * To handle the mix of per-Quad access and shared resources correctly, this
++ * driver treats the entire Si3474 package as one logical device. The driver
++ * instance associated with the primary I2C address (Quad 0) takes ownership.
++ * It discovers and manages the I2C client for the secondary address (Quad 1).
++ * This primary instance handles shared resources like IRQ management and
++ * registers a single PSE controller device representing all logical PIs.
++ * Internal functions route I2C commands to the appropriate Quad's i2c_client
++ * based on the target channel or PI.
++ *
++ * Terminology Mapping:
++ *
++ * - "PI" (Power Interface): Refers to the logical PSE port as defined by
++ * IEEE 802.3 (typically corresponds to an RJ45 connector). This is the
++ * `id` (0-7) used in the pse_controller_ops.
++ * - "Channel": Refers to one of the 8 physical power control paths within
++ * the Si3474 chip itself (hardware channels 0-7). This terminology is
++ * used internally within the driver to avoid confusion with 'ports'.
++ * - "Quad": One of the two internal 4-channel management units within the
++ * Si3474, each accessed via its own I2C address.
++ *
++ * Relationship:
++ * - A 2-Pair PoE PI uses 1 Channel.
++ * - A 4-Pair PoE PI uses 2 Channels.
++ *
++ * ASCII Schematic:
++ *
++ * +-----------------------------------------------------+
++ * |                    Si3474 Chip                      |
++ * |                                                     |
++ * | +---------------------+     +---------------------+ |
++ * | |      Quad 0         |     |      Quad 1         | |
++ * | | Channels 0, 1, 2, 3 |     | Channels 4, 5, 6, 7 | |
++ * | +----------^----------+     +-------^-------------+ |
++ * | I2C Addr 0 |                        | I2C Addr 1    |
++ * |            +------------------------+               |
++ * | (Primary Driver Instance) (Managed by Primary)      |
++ * |                                                     |
++ * | Shared Resources (affect whole chip):               |
++ * |  - Single INTb Output -> Handled by Primary         |
++ * |  - Single RESETb Input                              |
++ * |  - Single OSS Input   -> Handled by Primary         |
++ * |  - Global I2C Addr (0x7F) for Firmware Update       |
++ * |  - Global Status (Temp, VDD/VPWR UVLO)              |
++ * +-----------------------------------------------------+
++ *        |   |   |   |        |   |   |   |
++ *        Ch0 Ch1 Ch2 Ch3      Ch4 Ch5 Ch6 Ch7  (Physical Channels)
++ *
++ * Example Mapping (Logical PI to Physical Channel(s)):
++ * * 2-Pair Mode (8 PIs):
++ * PI 0 -> Ch 0
++ * PI 1 -> Ch 1
++ * ...
++ * PI 7 -> Ch 7
++ * * 4-Pair Mode (4 PIs):
++ * PI 0 -> Ch 0 + Ch 1  (Managed via Quad 0 Addr)
++ * PI 1 -> Ch 2 + Ch 3  (Managed via Quad 0 Addr)
++ * PI 2 -> Ch 4 + Ch 5  (Managed via Quad 1 Addr)
++ * PI 3 -> Ch 6 + Ch 7  (Managed via Quad 1 Addr)
++ * (Note: Actual mapping depends on Device Tree and PORT_REMAP config)
++ */
++
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pse-pd/pse.h>
++
++#define SI3474_MAX_CHANS 8
++
++#define MANUFACTURER_ID 0x08
++#define IC_ID 0x05
++#define SI3474_DEVICE_ID (MANUFACTURER_ID << 3 | IC_ID)
++
++/* Misc registers */
++#define VENDOR_IC_ID_REG 0x1B
++#define TEMPERATURE_REG 0x2C
++#define FIRMWARE_REVISION_REG 0x41
++#define CHIP_REVISION_REG 0x43
++
++/* Main status registers */
++#define POWER_STATUS_REG 0x10
++#define PORT_MODE_REG 0x12
++#define DETECT_CLASS_ENABLE_REG 0x14
++
++/* PORTn Current */
++#define PORT1_CURRENT_LSB_REG 0x30
++
++/* PORTn Current [mA], return in [nA] */
++/* 1000 * ((PORTn_CURRENT_MSB << 8) + PORTn_CURRENT_LSB) / 16384 */
++#define SI3474_NA_STEP (1000 * 1000 * 1000 / 16384)
++
++/* VPWR Voltage */
++#define VPWR_LSB_REG 0x2E
++#define VPWR_MSB_REG 0x2F
++
++/* PORTn Voltage */
++#define PORT1_VOLTAGE_LSB_REG 0x32
++
++/* VPWR Voltage [V], return in [uV] */
++/* 60 * (( VPWR_MSB << 8) + VPWR_LSB) / 16384 */
++#define SI3474_UV_STEP (1000 * 1000 * 60 / 16384)
++
++/* Helper macros */
++#define CHAN_IDX(chan) ((chan) % 4)
++#define CHAN_BIT(chan) BIT(CHAN_IDX(chan))
++#define CHAN_UPPER_BIT(chan) BIT(CHAN_IDX(chan) + 4)
++
++#define CHAN_MASK(chan) (0x03U << (2 * CHAN_IDX(chan)))
++#define CHAN_REG(base, chan) ((base) + (CHAN_IDX(chan) * 4))
++
++struct si3474_pi_desc {
++	u8 chan[2];
++	bool is_4p;
++};
++
++struct si3474_priv {
++	struct i2c_client *client[2];
++	struct pse_controller_dev pcdev;
++	struct device_node *np;
++	struct si3474_pi_desc pi[SI3474_MAX_CHANS];
++};
++
++static struct si3474_priv *to_si3474_priv(struct pse_controller_dev *pcdev)
++{
++	return container_of(pcdev, struct si3474_priv, pcdev);
++}
++
++static void si3474_get_channels(struct si3474_priv *priv, int id,
++				u8 *chan0, u8 *chan1)
++{
++	*chan0 = priv->pi[id].chan[0];
++	*chan1 = priv->pi[id].chan[1];
++}
++
++static struct i2c_client *si3474_get_chan_client(struct si3474_priv *priv,
++						 u8 chan)
++{
++	return (chan < 4) ? priv->client[0] : priv->client[1];
++}
++
++static int si3474_pi_get_admin_state(struct pse_controller_dev *pcdev, int id,
++				     struct pse_admin_state *admin_state)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	struct i2c_client *client;
++	bool is_enabled;
++	u8 chan0, chan1;
++	s32 ret;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++	client = si3474_get_chan_client(priv, chan0);
++
++	ret = i2c_smbus_read_byte_data(client, PORT_MODE_REG);
++	if (ret < 0) {
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_UNKNOWN;
++		return ret;
++	}
++
++	is_enabled = ret & (CHAN_MASK(chan0) | CHAN_MASK(chan1));
++
++	if (is_enabled)
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_ENABLED;
++	else
++		admin_state->c33_admin_state =
++			ETHTOOL_C33_PSE_ADMIN_STATE_DISABLED;
++
++	return 0;
++}
++
++static int si3474_pi_get_pw_status(struct pse_controller_dev *pcdev, int id,
++				   struct pse_pw_status *pw_status)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	struct i2c_client *client;
++	bool delivering;
++	u8 chan0, chan1;
++	s32 ret;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++	client = si3474_get_chan_client(priv, chan0);
++
++	ret = i2c_smbus_read_byte_data(client, POWER_STATUS_REG);
++	if (ret < 0) {
++		pw_status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_UNKNOWN;
++		return ret;
++	}
++
++	delivering = ret & (CHAN_UPPER_BIT(chan0) | CHAN_UPPER_BIT(chan1));
++
++	if (delivering)
++		pw_status->c33_pw_status =
++			ETHTOOL_C33_PSE_PW_D_STATUS_DELIVERING;
++	else
++		pw_status->c33_pw_status = ETHTOOL_C33_PSE_PW_D_STATUS_DISABLED;
++
++	return 0;
++}
++
++static int si3474_get_of_channels(struct si3474_priv *priv)
++{
++	struct pse_pi *pi;
++	u32 chan_id;
++	u8 pi_no;
++	s32 ret;
++
++	for (pi_no = 0; pi_no < SI3474_MAX_CHANS; pi_no++) {
++		pi = &priv->pcdev.pi[pi_no];
++		bool pairset_found = false;
++		u8 pairset_no;
++
++		for (pairset_no = 0; pairset_no < 2; pairset_no++) {
++			if (!pi->pairset[pairset_no].np)
++				continue;
++
++			pairset_found = true;
++
++			ret = of_property_read_u32(pi->pairset[pairset_no].np,
++						   "reg", &chan_id);
++			if (ret) {
++				dev_err(&priv->client[0]->dev,
++					"Failed to read channel reg property\n");
++				return ret;
++			}
++			if (chan_id > SI3474_MAX_CHANS) {
++				dev_err(&priv->client[0]->dev,
++					"Incorrect channel number: %d\n", chan_id);
++				return -EINVAL;
++			}
++
++			priv->pi[pi_no].chan[pairset_no] = chan_id;
++			/* Mark as 4-pair if second pairset is present */
++			priv->pi[pi_no].is_4p = (pairset_no == 1);
++		}
++
++		if (pairset_found && !priv->pi[pi_no].is_4p) {
++			dev_err(&priv->client[0]->dev,
++				"Second pairset is missing for PI %pOF, only 4p configs are supported\n",
++				pi->np);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
++static int si3474_setup_pi_matrix(struct pse_controller_dev *pcdev)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	s32 ret;
++
++	ret = si3474_get_of_channels(priv);
++	if (ret < 0)
++		dev_warn(&priv->client[0]->dev,
++			 "Unable to parse DT PSE power interface matrix\n");
++
++	return ret;
++}
++
++static int si3474_pi_enable(struct pse_controller_dev *pcdev, int id)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	struct i2c_client *client;
++	u8 chan0, chan1;
++	s32 ret;
++	u8 val;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++	client = si3474_get_chan_client(priv, chan0);
++
++	/* Release PI from shutdown */
++	ret = i2c_smbus_read_byte_data(client, PORT_MODE_REG);
++	if (ret < 0)
++		return ret;
++
++	val = (u8)ret;
++	val |= CHAN_MASK(chan0);
++	val |= CHAN_MASK(chan1);
++
++	ret = i2c_smbus_write_byte_data(client, PORT_MODE_REG, val);
++	if (ret)
++		return ret;
++
++	/* DETECT_CLASS_ENABLE must be set when using AUTO mode,
++	 * otherwise PI does not power up - datasheet section 2.10.2
++	 */
++	val = CHAN_BIT(chan0) | CHAN_UPPER_BIT(chan0) |
++	      CHAN_BIT(chan1) | CHAN_UPPER_BIT(chan1);
++
++	ret = i2c_smbus_write_byte_data(client, DETECT_CLASS_ENABLE_REG, val);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int si3474_pi_disable(struct pse_controller_dev *pcdev, int id)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	struct i2c_client *client;
++	u8 chan0, chan1;
++	s32 ret;
++	u8 val;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++	client = si3474_get_chan_client(priv, chan0);
++
++	/* Set PI in shutdown mode */
++	ret = i2c_smbus_read_byte_data(client, PORT_MODE_REG);
++	if (ret < 0)
++		return ret;
++
++	val = (u8)ret;
++	val &= ~CHAN_MASK(chan0);
++	val &= ~CHAN_MASK(chan1);
++
++	ret = i2c_smbus_write_byte_data(client, PORT_MODE_REG, val);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int si3474_pi_get_chan_current(struct si3474_priv *priv, u8 chan)
++{
++	struct i2c_client *client;
++	u64 tmp_64;
++	s32 ret;
++	u8 reg;
++
++	client = si3474_get_chan_client(priv, chan);
++
++	/* Registers 0x30 to 0x3d */
++	reg = CHAN_REG(PORT1_CURRENT_LSB_REG, chan);
++
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	tmp_64 = ret * SI3474_NA_STEP;
++
++	/* uA = nA / 1000 */
++	tmp_64 = DIV_ROUND_CLOSEST_ULL(tmp_64, 1000);
++	return (int)tmp_64;
++}
++
++static int si3474_pi_get_chan_voltage(struct si3474_priv *priv, u8 chan)
++{
++	struct i2c_client *client;
++	s32 ret;
++	u32 val;
++	u8 reg;
++
++	client = si3474_get_chan_client(priv, chan);
++
++	/* Registers 0x32 to 0x3f */
++	reg = CHAN_REG(PORT1_VOLTAGE_LSB_REG, chan);
++
++	ret = i2c_smbus_read_word_data(client, reg);
++	if (ret < 0)
++		return ret;
++
++	val = ret * SI3474_UV_STEP;
++
++	return (int)val;
++}
++
++static int si3474_pi_get_voltage(struct pse_controller_dev *pcdev, int id)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	struct i2c_client *client;
++	u8 chan0, chan1;
++	s32 ret;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++	client = si3474_get_chan_client(priv, chan0);
++
++	/* Check which channels are enabled*/
++	ret = i2c_smbus_read_byte_data(client, POWER_STATUS_REG);
++	if (ret < 0)
++		return ret;
++
++	/* Take voltage from the first enabled channel */
++	if (ret & CHAN_BIT(chan0))
++		ret = si3474_pi_get_chan_voltage(priv, chan0);
++	else if (ret & CHAN_BIT(chan1))
++		ret = si3474_pi_get_chan_voltage(priv, chan1);
++	else
++		/* 'should' be no voltage in this case */
++		return 0;
++
++	return ret;
++}
++
++static int si3474_pi_get_actual_pw(struct pse_controller_dev *pcdev, int id)
++{
++	struct si3474_priv *priv = to_si3474_priv(pcdev);
++	u8 chan0, chan1;
++	u32 uV, uA;
++	u64 tmp_64;
++	s32 ret;
++
++	ret = si3474_pi_get_voltage(&priv->pcdev, id);
++
++	/* Do not read currents if voltage is 0 */
++	if (ret <= 0)
++		return ret;
++	uV = ret;
++
++	si3474_get_channels(priv, id, &chan0, &chan1);
++
++	ret = si3474_pi_get_chan_current(priv, chan0);
++	if (ret < 0)
++		return ret;
++	uA = ret;
++
++	ret = si3474_pi_get_chan_current(priv, chan1);
++	if (ret < 0)
++		return ret;
++	uA += ret;
++
++	tmp_64 = uV;
++	tmp_64 *= uA;
++	/* mW = uV * uA / 1000000000 */
++	return DIV_ROUND_CLOSEST_ULL(tmp_64, 1000000000);
++}
++
++static const struct pse_controller_ops si3474_ops = {
++	.setup_pi_matrix = si3474_setup_pi_matrix,
++	.pi_enable = si3474_pi_enable,
++	.pi_disable = si3474_pi_disable,
++	.pi_get_actual_pw = si3474_pi_get_actual_pw,
++	.pi_get_voltage = si3474_pi_get_voltage,
++	.pi_get_admin_state = si3474_pi_get_admin_state,
++	.pi_get_pw_status = si3474_pi_get_pw_status,
++};
++
++static void si3474_ancillary_i2c_remove(void *data)
++{
++	struct i2c_client *client = data;
++
++	i2c_unregister_device(client);
++}
++
++static int si3474_i2c_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct si3474_priv *priv;
++	u8 fw_version;
++	s32 ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
++		dev_err(dev, "i2c check functionality failed\n");
++		return -ENXIO;
++	}
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	ret = i2c_smbus_read_byte_data(client, VENDOR_IC_ID_REG);
++	if (ret < 0)
++		return ret;
++
++	if (ret != SI3474_DEVICE_ID) {
++		dev_err(dev, "Wrong device ID: 0x%x\n", ret);
++		return -ENXIO;
++	}
++
++	ret = i2c_smbus_read_byte_data(client, FIRMWARE_REVISION_REG);
++	if (ret < 0)
++		return ret;
++	fw_version = ret;
++
++	ret = i2c_smbus_read_byte_data(client, CHIP_REVISION_REG);
++	if (ret < 0)
++		return ret;
++
++	dev_dbg(dev, "Chip revision: 0x%x, firmware version: 0x%x\n",
++		ret, fw_version);
++
++	priv->client[0] = client;
++	i2c_set_clientdata(client, priv);
++
++	priv->client[1] = i2c_new_ancillary_device(priv->client[0], "secondary",
++						   priv->client[0]->addr + 1);
++	if (IS_ERR(priv->client[1]))
++		return PTR_ERR(priv->client[1]);
++
++	ret = devm_add_action_or_reset(dev, si3474_ancillary_i2c_remove, priv->client[1]);
++	if (ret < 0) {
++		dev_err(&priv->client[1]->dev, "Cannot register remove callback\n");
++		return ret;
++	}
++
++	ret = i2c_smbus_read_byte_data(priv->client[1], VENDOR_IC_ID_REG);
++	if (ret < 0) {
++		dev_err(&priv->client[1]->dev, "Cannot access secondary PSE controller\n");
++		return ret;
++	}
++
++	if (ret != SI3474_DEVICE_ID) {
++		dev_err(&priv->client[1]->dev,
++			"Wrong device ID for secondary PSE controller: 0x%x\n", ret);
++		return -ENXIO;
++	}
++
++	priv->np = dev->of_node;
++	priv->pcdev.owner = THIS_MODULE;
++	priv->pcdev.ops = &si3474_ops;
++	priv->pcdev.dev = dev;
++	priv->pcdev.types = ETHTOOL_PSE_C33;
++	priv->pcdev.nr_lines = SI3474_MAX_CHANS;
++
++	ret = devm_pse_controller_register(dev, &priv->pcdev);
++	if (ret) {
++		dev_err(dev, "Failed to register PSE controller: 0x%x\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static const struct i2c_device_id si3474_id[] = {
++	{ "si3474" },
++	{}
++};
++MODULE_DEVICE_TABLE(i2c, si3474_id);
++
++static const struct of_device_id si3474_of_match[] = {
++	{
++		.compatible = "skyworks,si3474",
++	},
++	{},
++};
++MODULE_DEVICE_TABLE(of, si3474_of_match);
++
++static struct i2c_driver si3474_driver = {
++	.probe = si3474_i2c_probe,
++	.id_table = si3474_id,
++	.driver = {
++		.name = "si3474",
++		.of_match_table = si3474_of_match,
++	},
++};
++module_i2c_driver(si3474_driver);
++
++MODULE_AUTHOR("Piotr Kubik <piotr.kubik@adtran.com>");
++MODULE_DESCRIPTION("Skyworks Si3474 PoE PSE Controller driver");
++MODULE_LICENSE("GPL");
