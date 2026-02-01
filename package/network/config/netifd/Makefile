@@ -1,13 +1,18 @@
 include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=netifd
-PKG_RELEASE:=3
+PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL=$(PROJECT_GIT)/project/netifd.git
+#PKG_SOURCE_URL=$(PROJECT_GIT)/project/netifd.git
+PKG_SOURCE_URL:=https://github.com/carlosz1986/netifd.git
 PKG_SOURCE_DATE:=2025-10-20
-PKG_SOURCE_VERSION:=777f5942fa7d6245f6ad29daa1daecc400344d37
-PKG_MIRROR_HASH:=7fc56f436faa1a5b05a147febed52c6f58c479125a38c9737736b352cd8d4409
+PKG_SOURCE_VERSION:=bba372922f10f1fb91a0ad7b5ed278b24d113cfa
+
+#PKG_MIRROR_HASH:=7fc56f436faa1a5b05a147febed52c6f58c479125a38c9737736b352cd8d4409
+PKG_MIRROR_HASH:=skip
+
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 PKG_LICENSE:=GPL-2.0
@@ -31,8 +36,20 @@ define Package/netifd/conffiles
 /etc/udhcpc.user.d/
 endef
 
+# Stage kernel ethtool headers separately to avoid ioctl.h conflicts
+# Only ethtool_netlink.h needs the newer kernel version (for PSE attributes)
+ETHTOOL_HEADERS_DIR := $(PKG_BUILD_DIR)/kernel-headers
+
+define Build/Prepare
+	$(call Build/Prepare/Default)
+	$(INSTALL_DIR) $(ETHTOOL_HEADERS_DIR)/linux
+	$(CP) $(LINUX_DIR)/user_headers/include/linux/ethtool.h $(ETHTOOL_HEADERS_DIR)/linux/
+	$(CP) $(LINUX_DIR)/user_headers/include/linux/ethtool_netlink.h $(ETHTOOL_HEADERS_DIR)/linux/
+endef
+
 TARGET_CFLAGS += \
 	-I$(STAGING_DIR)/usr/include/libnl-tiny \
+	-I$(ETHTOOL_HEADERS_DIR) \
 	-I$(STAGING_DIR)/usr/include
 
 CMAKE_OPTIONS += \
