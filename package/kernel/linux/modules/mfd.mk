@@ -10,7 +10,8 @@ MFD_MENU:=MultiFunction Device (MFD) Support
 define KernelPackage/mfd-hasivo-stc8
   SUBMENU:=$(MFD_MENU)
   TITLE:=Hasivo STC8 microcontroller support
-  KCONFIG:=CONFIG_MFD_HASIVO_STC8
+  KCONFIG:=CONFIG_MFD_HASIVO_STC8 \
+	CONFIG_LEDS_SYSCON=y
   FILES:=$(LINUX_DIR)/drivers/mfd/hasivo-stc8-mfd.ko
   AUTOLOAD:=$(call AutoProbe,hasivo-stc8-mfd)
 endef
