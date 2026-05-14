@@ -1,0 +1,292 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "rtl931x.dtsi"
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/phy/phy.h>
+
+/ {
+	compatible = "hasivo,s1300wp-8xgt-4s-plus", "realtek,rtl9313-soc";
+	model = "Hasivo S1300WP-8XGT-4S+";
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x10000000>,
+		      <0x90000000 0x10000000>;
+	};
+
+	aliases {
+		label-mac-device = &ethernet0;
+		led-boot = &led_sys;
+		led-failsafe = &led_sys;
+		led-running = &led_sys;
+		led-upgrade = &led_sys;
+	};
+
+	chosen {
+		stdout-path = "serial0:38400n8";
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		button-reset {
+			label = "reset";
+			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	sfp1: sfp-p3 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c1_sda8>;
+		mod-def0-gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	sfp2: sfp-p4 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c1_sda6>;
+		mod-def0-gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	sfp3: sfp-p1 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c1_sda0>;
+		mod-def0-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	sfp4: sfp-p2 {
+		compatible = "sff,sfp";
+		i2c-bus = <&i2c1_sda1>;
+		mod-def0-gpios = <&gpio0 19 GPIO_ACTIVE_LOW>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	/*
+	 * Bit-banged i2c on SoC port A pins 4/3 (lines 28/27). pinmux_disable_jtag
+	 * releases port A pins 3-7 from JTAG so they can be used as GPIO.
+	 *
+	 * Slaves present on this bus (from i2cdetect):
+	 *   0x0D, 0x15  Microsemi PD69x0x-family PoE PSE controllers
+	 *               (present on the PCB; this SKU doesn't expose PoE)
+	 *   0x4D        Hasivo board-specific MCU (STC8 family); identity
+	 *               at reg 0x09 = 0x91
+	 *   0x50        24Cxx-class EEPROM (DM2016 license / board info)
+	 *   0x51        PCF8563 RTC                              (bound below)
+	 *   0x6F        MCU watchdog; identity at reg 0xFD = 0x91 (bound below)
+	 */
+	i2c_sys: i2c-system {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinmux_disable_jtag>;
+
+		scl-gpios = <&gpio0 28 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		sda-gpios = <&gpio0 27 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <28>;
+
+		rtc@51 {
+			compatible = "nxp,pcf8563";
+			reg = <0x51>;
+		};
+
+		mcu_wdt: mcu@6f {
+			compatible = "hasivo,mcu-wdt";
+			reg = <0x6f>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_sys: led-0 {
+			gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+		};
+	};
+
+	/*
+	 * Per-port LED matrix driven by the SoC's hardware LED scan engine.
+	 *
+	 * Known issue: the port-to-physical-LED mapping is scrambled on this
+	 * PCB (e.g. port 53's link state lights port 55's LED). Mainline only
+	 * programs the documented LED block (0x0600..0x0668); stock firmware
+	 * uses additional silicon configuration via the indirect-access
+	 * register at 0x066c that has no public bit-layout documentation.
+	 * The 12 ports work for traffic; only the front-panel indication is
+	 * wrong. Fixing this requires either a stock-firmware register dump
+	 * from identical hardware or the RTL9313 SDK reg-table.
+	 */
+	led_set {
+		compatible = "realtek,rtl9300-leds";
+		active-low;
+
+		led_set0 = <(RTL93XX_LED_SET_10G |
+			     RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)>;
+	};
+};
+
+&i2c_mst1 {
+	status = "okay";
+
+	i2c1_sda0: i2c@0 { reg = <0>; };
+	i2c1_sda1: i2c@1 { reg = <1>; };
+	i2c1_sda6: i2c@6 { reg = <6>; };
+	i2c1_sda8: i2c@8 { reg = <8>; };
+};
+
+&spi0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x000000 0x0e0000>;
+				read-only;
+			};
+
+			partition@e0000 {
+				label = "bdinfo";
+				reg = <0x0e0000 0x010000>;
+				read-only;
+			};
+
+			partition@f0000 {
+				label = "sysinfo";
+				reg = <0x0f0000 0x010000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "cfg";
+				reg = <0x100000 0x100000>;
+			};
+
+			partition@200000 {
+				label = "log";
+				reg = <0x200000 0x100000>;
+			};
+
+			partition@300000 {
+				compatible = "openwrt,uimage", "denx,uimage";
+				label = "firmware";
+				reg = <0x300000 0x1d00000>;
+			};
+		};
+	};
+};
+
+&mdio_ctrl {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinmux_enable_mdc_mdio_0>,
+		    <&pinmux_enable_mdc_mdio_1>;
+};
+
+&mdio_bus0 {
+	PHY_C45(0,  0)
+	PHY_C45(8,  1)
+	PHY_C45(16, 2)
+	PHY_C45(24, 3)
+};
+
+&mdio_bus1 {
+	PHY_C45(32, 4)
+	PHY_C45(40, 5)
+	PHY_C45(48, 6)
+	PHY_C45(50, 7)
+};
+
+&phy0  { realtek,pnswap-tx; };
+&phy8  { realtek,pnswap-tx; };
+&phy16 { realtek,pnswap-tx; };
+&phy24 { realtek,pnswap-tx; };
+&phy32 { realtek,pnswap-tx; };
+&phy40 { realtek,pnswap-tx; };
+&phy48 { realtek,pnswap-tx; };
+&phy50 { realtek,pnswap-tx; };
+
+&switch0 {
+	ethernet-ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		SWITCH_PORT_LED(0,  1, 2, 0, usxgmii)
+		SWITCH_PORT_LED(8,  2, 3, 0, usxgmii)
+		SWITCH_PORT_LED(16, 3, 4, 0, usxgmii)
+		SWITCH_PORT_LED(24, 4, 5, 0, usxgmii)
+		SWITCH_PORT_LED(32, 5, 6, 0, usxgmii)
+		SWITCH_PORT_LED(40, 6, 7, 0, usxgmii)
+		SWITCH_PORT_LED(48, 7, 8, 0, usxgmii)
+		SWITCH_PORT_LED(50, 8, 9, 0, usxgmii)
+
+		SWITCH_PORT_SFP(52, 9,  10, 0, 1)
+		SWITCH_PORT_SFP(53, 10, 11, 0, 2)
+		SWITCH_PORT_SFP(54, 11, 12, 0, 3)
+		SWITCH_PORT_SFP(55, 12, 13, 0, 4)
+
+		port@56 {
+			ethernet = <&ethernet0>;
+			reg = <56>;
+			phy-mode = "internal";
+
+			fixed-link {
+				speed = <1000>;
+				full-duplex;
+			};
+		};
+	};
+};
+
+/* PCB inverts TX on all four SFP+ lanes; RX is normal. */
+&serdes10 { tx-polarity = <PHY_POL_INVERT>; };
+&serdes11 { tx-polarity = <PHY_POL_INVERT>; };
+&serdes12 { tx-polarity = <PHY_POL_INVERT>; };
+&serdes13 { tx-polarity = <PHY_POL_INVERT>; };
+
+/*
+ * Copper SerDes polarity compensates for the RTL8264 quad-port PHY's
+ * per-port HSO_INV / HSI_INV defaults:
+ *   even MDIO addr (chip port 0, 2): HSO_INV only       → SoC inverts RX
+ *   odd  MDIO addr (chip port 1, 3): HSO_INV + HSI_INV  → SoC inverts TX + RX
+ */
+&serdes2 { rx-polarity = <PHY_POL_INVERT>; };
+&serdes3 {
+	tx-polarity = <PHY_POL_INVERT>;
+	rx-polarity = <PHY_POL_INVERT>;
+};
+&serdes4 { rx-polarity = <PHY_POL_INVERT>; };
+&serdes5 {
+	tx-polarity = <PHY_POL_INVERT>;
+	rx-polarity = <PHY_POL_INVERT>;
+};
+&serdes6 { rx-polarity = <PHY_POL_INVERT>; };
+&serdes7 {
+	tx-polarity = <PHY_POL_INVERT>;
+	rx-polarity = <PHY_POL_INVERT>;
+};
+&serdes8 { rx-polarity = <PHY_POL_INVERT>; };
+&serdes9 {
+	tx-polarity = <PHY_POL_INVERT>;
+	rx-polarity = <PHY_POL_INVERT>;
+};
+
+&uart0 { status = "okay"; };
+&uart1 { status = "disabled"; };
