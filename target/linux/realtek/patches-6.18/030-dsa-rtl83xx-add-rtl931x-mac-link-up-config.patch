@@ -1,0 +1,89 @@
+From: Carlo <carlo@local>
+Date: Tue, 28 Apr 2026 00:00:00 +0000
+Subject: [PATCH] net: dsa: rtl83xx: program MAC_FORCE_MODE_CTRL on RTL9310 link-up
+
+`rtldsa_93xx_phylink_mac_link_up()` only modifies the MAC force-mode
+register when `priv->family_id == RTL9300_FAMILY_ID`. For RTL9310/9313
+the function reads the register, never modifies it, and writes the
+unchanged value back. Only the TX/RX-enable bits in MAC_L2_PORT_CTRL get
+toggled.
+
+The consequence: when phylink reports "Link is Up - 10Gbps/Full" for an
+RTL9313 SFP+ port, the MAC's speed/duplex/force-link configuration is
+never updated. The MAC stays at its reset default while the SerDes/PCS
+runs at 10G. Frames at 10G line rate are silently dropped at the MAC
+RX boundary (no rx_errors, no rx_dropped — the discard happens before
+any error counter is touched).
+
+Empirically observed on the Hasivo S1300WP-8XGT-4S+ (RTL9313, port_type
+0x1b):
+- `lanN: configuring for inband/10gbase-r link mode`
+- `lanN: Link is Up - 10Gbps/Full - flow control off`
+- `ethtool -S lanN` shows tx_packets growing, rx_packets nearly flat
+- `ethtool -S lanN` shows zero CRC errors, zero drops anywhere
+- ARP unanswered; peer never visible despite responding on the wire
+
+Add an RTL9310 branch that mirrors the RTL9300 logic with RTL931X bit
+positions. Bit positions are taken from rtl-otto.h existing definitions
+(FORCE_LINK_EN, DUPLEX_MODE, MAC_FORCE_FC_EN, FORCE_EN, TX_PAUSE_EN,
+RX_PAUSE_EN). The speed-field position is HYPOTHESIZED at bits [11:14]
+(4-bit field) based on three pieces of evidence:
+
+  1. RTPCS_93XX_MAC_LINK_SPD_BITS = 4 in pcs-rtl-otto.c (the read-back
+     speed-status register uses 4 bits per port, suggesting the same
+     encoding width on the force-mode register).
+  2. The hardcoded RTL931X CPU-port init value 0x2a1d in rtl838x_eth.c:
+     decoded as bits [11:14] = 0101 = 5 = RTPCS_SPEED_2500 (2.5G), which
+     matches the expected internal CPU port rate for a 56-port RTL9313.
+  3. No other plausible 4-bit window in the register fits the verified
+     bit positions (FC_EN at 4 and FORCE_EN at 9 fence the field).
+
+The RTL931X SDK source ("cypress" chipdef directory in the Realtek SDK)
+is not available in our reference U-Boot tree; this fix should be
+validated against a register-read on a working RTL9313 board before
+upstream submission.
+
+Signed-off-by: Carlo <carlo@local>
+---
+ drivers/net/dsa/rtl83xx/dsa.c        | 18 ++++++++++++++++++
+ drivers/net/dsa/rtl83xx/rtl-otto.h   |  2 ++
+ 2 files changed, 20 insertions(+)
+
+--- a/drivers/net/dsa/rtl83xx/rtl-otto.h
++++ b/drivers/net/dsa/rtl83xx/rtl-otto.h
+@@ -190,6 +190,8 @@
+ #define RTL931X_FORCE_EN			BIT(9)
+ #define RTL931X_FORCE_LINK_EN			BIT(0)
+ #define RTL931X_DUPLEX_MODE			BIT(2)
++#define RTL931X_SPEED_SHIFT			(11)
++#define RTL931X_SPEED_MASK			(0xf << RTL931X_SPEED_SHIFT)
+ #define RTL931X_MAC_FORCE_FC_EN			BIT(4)
+ #define RTL931X_TX_PAUSE_EN			BIT(16)
+ #define RTL931X_RX_PAUSE_EN			BIT(17)
+--- a/drivers/net/dsa/rtl83xx/dsa.c
++++ b/drivers/net/dsa/rtl83xx/dsa.c
+@@ -526,6 +526,24 @@ static void rtldsa_93xx_phylink_mac_link
+ 			mcr |= RTL930X_DUPLEX_MODE;
+ 		if (dsa_port_is_cpu(dp) || priv->ports[port].phy)
+ 			mcr |= RTL930X_FORCE_EN;
++	} else if (priv->family_id == RTL9310_FAMILY_ID) {
++		mcr &= ~RTL931X_RX_PAUSE_EN;
++		mcr &= ~RTL931X_TX_PAUSE_EN;
++		mcr &= ~RTL931X_DUPLEX_MODE;
++		mcr &= ~RTL931X_SPEED_MASK;
++		mcr &= ~RTL931X_MAC_FORCE_FC_EN;
++		mcr |= RTL931X_FORCE_LINK_EN;
++		mcr |= spdsel << RTL931X_SPEED_SHIFT;
++
++		if (tx_pause)
++			mcr |= RTL931X_TX_PAUSE_EN;
++		if (rx_pause)
++			mcr |= RTL931X_RX_PAUSE_EN;
++		if (tx_pause || rx_pause)
++			mcr |= RTL931X_MAC_FORCE_FC_EN;
++		if (duplex == DUPLEX_FULL || priv->lagmembers & BIT_ULL(port))
++			mcr |= RTL931X_DUPLEX_MODE;
++		mcr |= RTL931X_FORCE_EN;
+ 	}
+
+ 	pr_debug("%s port %d, mode %x, speed %d, duplex %d, txpause %d, rxpause %d: set mcr=%08x\n",
