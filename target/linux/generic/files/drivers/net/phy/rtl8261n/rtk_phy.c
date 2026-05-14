@@ -134,6 +134,21 @@ static int rtkphy_config_init(struct phy_device *phydev)
                                  REALTEK_SERDES_GLOBAL_CFG,
                                  REALTEK_HSO_INV);
 
+            /*
+             * Take chip out of low-power state. The upstream "fix rtl8261n
+             * driver for realtek" commit (b77fa45d12) skipped the standard
+             * c45 resume / power-normal calls on CONFIG_MACH_REALTEK_RTL
+             * platforms, assuming the bootloader already initialized the
+             * PHYs. On boards where the bootloader doesn't (e.g., Hasivo
+             * S1300WP-8XGT-4S+ with stock U-Boot booting OpenWrt), the
+             * chip stays in PMA low-power mode (PMA_CTRL bit 11 = 1), the
+             * line side never engages and auto-negotiation never starts.
+             * Explicitly clear bit 11 here at config_init so the chip
+             * enters operational state.
+             */
+            phy_clear_bits_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_CTRL1,
+                               MDIO_CTRL1_LPOWER);
+
             break;
         default:
             phydev_err(phydev, "%s:%u Unknow phy_id: 0x%X\n", __FUNCTION__, __LINE__, phydev->drv->phy_id);
