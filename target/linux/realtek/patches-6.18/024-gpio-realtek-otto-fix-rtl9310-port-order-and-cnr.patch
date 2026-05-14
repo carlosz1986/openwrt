@@ -1,0 +1,169 @@
+From: Carlo <carlo@local>
+Date: Wed, 22 Apr 2026 00:00:00 +0000
+Subject: [PATCH] gpio: realtek-otto: fix RTL9310 port order, IMR layout, and add CNR support
+
+The RTL9310 GPIO controller has the same register layout as RTL9300
+(Port A in the most-significant byte), but the of_match entry was
+missing the GPIO_PORTS_REVERSED flag. Without this flag, the generic
+chip framework uses ioread32be() which on MIPS big-endian does no byte
+swap, causing pin N to map to the wrong physical bit.
+
+Additionally, RTL9310 has a CNR (Pin Function Control) register at
+offset 0x00 that gates GPIO access per-pin:
+  bit = 0: GPIO mode (pin controllable)
+  bit = 1: peripheral mode (GPIO blocked)
+The reset default is 0xFFFFFFFF (all peripheral). RTL9300 does not
+have this register. Add request/free callbacks that clear/set the
+CNR bit when a GPIO is requested/freed, gated by a new GPIO_HAS_CNR
+flag on RTL9310.
+
+Finally, on RTL9310/9313 the silicon's IMR_AB / IMR_CD registers use
+the port-keyed [BA, DC] layout the driver's GPIO_PORTS_REVERSED comment
+documents - IMR_AB (0x14) stores [port B | port A] (port B in the low
+half), IMR_CD (0x18) stores [port D | port C]. The default
+realtek_gpio_line_imr_pos() returns "2 * line", which is line-direct
+and puts every requested line's mask in the wrong register half.
+Empirically on RTL9313: driver writes IMR_CD bits 6:7 for line 19
+(port B pin 3); no IRQ ever fires. Manually moving those bits to
+IMR_AB causes hot-plug events to deliver correctly. Add a new
+GPIO_IMR_PORT_KEYED flag and a corresponding line-position helper
+"(2 * line) ^ 32" that flips the IMR_AB <-> IMR_CD selection without
+changing the within-half shift. Set the flag for "realtek,rtl9310-gpio"
+only; do NOT change behaviour for RTL9300 / RTL9302 / RTL9303 / RTL9607
+where GPIO IRQ delivery has not been re-tested. Those chips also use
+GPIO_PORTS_REVERSED and may share the same latent issue, but it must be
+verified per-platform (e.g. xikestor sks8300, hasivo s600wp use SFP
+mod-def0-gpios on RTL9302/9303 and would need to be confirmed before
+flipping their IMR formula).
+
+Without all three fixes, GPIO bit-bang I2C (i2c-gpio) on RTL9310/RTL9313
+fails because pins are mapped incorrectly AND locked in peripheral mode,
+and any GPIO consumer that needs IRQs (sfp mod-def0, gpio-keys, etc.)
+silently receives no events.
+
+Signed-off-by: Carlo <carlo@local>
+---
+--- a/drivers/gpio/gpio-realtek-otto.c	2026-04-28 22:31:22.236179786 +0200
++++ b/drivers/gpio/gpio-realtek-otto.c	2026-04-28 22:32:31.069675016 +0200
+@@ -68,6 +68,7 @@
+ 	struct gpio_generic_chip chip;
+ 	void __iomem *base;
+ 	void __iomem *cpumask_base;
++	unsigned int dev_flags;
+ 	struct cpumask cpu_irq_maskable;
+ 	raw_spinlock_t lock;
+ 	u8 intr_mask[REALTEK_GPIO_MAX];
+@@ -96,6 +97,21 @@
+ 	 * range, where the per-cpu enable masks are located.
+ 	 */
+ 	GPIO_INTERRUPTS_PER_CPU = BIT(2),
++	/*
++	 * Has a CNR (pin function control) register at offset 0x00.
++	 * Pins default to peripheral mode and must be switched to GPIO mode.
++	 */
++	GPIO_HAS_CNR = BIT(3),
++	/*
++	 * IMR registers are port-keyed [BA, DC] even when the line numbering
++	 * is byte-reversed. IMR_AB (offset 0x14) stores [port B | port A]
++	 * masks (port B in the low half), IMR_CD (0x18) stores
++	 * [port D | port C]. Lines 16..31 (ports B/A) live in IMR_AB and
++	 * lines 0..15 (ports D/C) live in IMR_CD; the simple "2 * line"
++	 * formula picks the wrong register. Empirically verified on
++	 * RTL9313 only - set this flag per chip after testing.
++	 */
++	GPIO_IMR_PORT_KEYED = BIT(4),
+ };
+ 
+ static struct realtek_gpio_ctrl *irq_data_to_ctrl(struct irq_data *data)
+@@ -154,6 +170,11 @@
+ 	return 2 * line;
+ }
+ 
++static unsigned int realtek_gpio_line_imr_pos_port_keyed(unsigned int line)
++{
++	return (2 * line) ^ 32;
++}
++
+ static void realtek_gpio_clear_isr(struct realtek_gpio_ctrl *ctrl, u32 mask)
+ {
+ 	ctrl->bank_write(ctrl->base + REALTEK_GPIO_REG_ISR, mask);
+@@ -333,6 +354,40 @@
+ 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+ };
+ 
++static int realtek_gpio_request(struct gpio_chip *gc, unsigned int offset)
++{
++	struct realtek_gpio_ctrl *ctrl = gpiochip_get_data(gc);
++	unsigned long flags;
++	u32 cnr;
++
++	if (!(ctrl->dev_flags & GPIO_HAS_CNR))
++		return 0;
++
++	raw_spin_lock_irqsave(&ctrl->lock, flags);
++	cnr = ctrl->bank_read(ctrl->base + REALTEK_GPIO_REG_CNR);
++	cnr &= ~BIT(offset);
++	ctrl->bank_write(ctrl->base + REALTEK_GPIO_REG_CNR, cnr);
++	raw_spin_unlock_irqrestore(&ctrl->lock, flags);
++
++	return 0;
++}
++
++static void realtek_gpio_free(struct gpio_chip *gc, unsigned int offset)
++{
++	struct realtek_gpio_ctrl *ctrl = gpiochip_get_data(gc);
++	unsigned long flags;
++	u32 cnr;
++
++	if (!(ctrl->dev_flags & GPIO_HAS_CNR))
++		return;
++
++	raw_spin_lock_irqsave(&ctrl->lock, flags);
++	cnr = ctrl->bank_read(ctrl->base + REALTEK_GPIO_REG_CNR);
++	cnr |= BIT(offset);
++	ctrl->bank_write(ctrl->base + REALTEK_GPIO_REG_CNR, cnr);
++	raw_spin_unlock_irqrestore(&ctrl->lock, flags);
++}
++
+ static const struct of_device_id realtek_gpio_of_match[] = {
+ 	{
+ 		.compatible = "realtek,otto-gpio",
+@@ -350,6 +405,7 @@
+ 	},
+ 	{
+ 		.compatible = "realtek,rtl9310-gpio",
++		.data = (void *)(GPIO_PORTS_REVERSED | GPIO_HAS_CNR | GPIO_IMR_PORT_KEYED),
+ 	},
+ 	{}
+ };
+@@ -374,6 +430,8 @@
+ 
+ 	dev_flags = (unsigned int) device_get_match_data(dev);
+ 
++	ctrl->dev_flags = dev_flags;
++
+ 	ngpios = REALTEK_GPIO_MAX;
+ 	device_property_read_u32(dev, "ngpios", &ngpios);
+ 
+@@ -401,6 +459,9 @@
+ 		ctrl->line_imr_pos = realtek_gpio_line_imr_pos_swapped;
+ 	}
+ 
++	if (dev_flags & GPIO_IMR_PORT_KEYED)
++		ctrl->line_imr_pos = realtek_gpio_line_imr_pos_port_keyed;
++
+ 	config = (struct gpio_generic_chip_config) {
+ 		.dev = dev,
+ 		.sz = 4,
+@@ -418,6 +479,11 @@
+ 	ctrl->chip.gc.ngpio = ngpios;
+ 	ctrl->chip.gc.owner = THIS_MODULE;
+ 
++	if (dev_flags & GPIO_HAS_CNR) {
++		ctrl->chip.gc.request = realtek_gpio_request;
++		ctrl->chip.gc.free = realtek_gpio_free;
++	}
++
+ 	irq = platform_get_irq_optional(pdev, 0);
+ 	if (!(dev_flags & GPIO_INTERRUPTS_DISABLED) && irq > 0) {
+ 		girq = &ctrl->chip.gc.irq;
